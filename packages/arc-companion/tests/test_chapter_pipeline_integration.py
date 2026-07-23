@@ -1283,7 +1283,7 @@ def test_restart_generation_rotates_session_and_invalidates_suffix(
     tmp_path: Path, monkeypatch,
 ) -> None:
     project = tmp_path / "run"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / ("3" * 64)
     ledger_path = checkpoint / "chapters" / "ch-0001" / "translation-ledger.json"
     initialize_lane_ledger(
         ledger_path, chapter_id="ch-0001", lane="translation", segment_ids=["s1", "s2"],
@@ -1300,7 +1300,7 @@ def test_restart_generation_rotates_session_and_invalidates_suffix(
     manager.update_native_session_id("ch-0001:translation", "native-1")
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
-        "status": "needs_supervision", "checkpoint_dir": str(checkpoint),
+        "status": "needs_supervision", "fingerprint": "3" * 64, "checkpoint_dir": str(checkpoint),
         "recovery_options": {"paper_id": "local:book", "workers": 1},
     }))
     captured = {}
@@ -1329,7 +1329,7 @@ def test_restart_generation_transaction_replays_after_crash_between_session_and_
     tmp_path: Path, monkeypatch,
 ) -> None:
     project = tmp_path / "run"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / ("3" * 64)
     ledger_path = checkpoint / "chapters" / "ch-0001" / "translation-ledger.json"
     initialize_lane_ledger(
         ledger_path, chapter_id="ch-0001", lane="translation", segment_ids=["s1"]
@@ -1347,7 +1347,7 @@ def test_restart_generation_transaction_replays_after_crash_between_session_and_
     )
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
-        "status": "needs_supervision", "checkpoint_dir": str(checkpoint),
+        "status": "needs_supervision", "fingerprint": "3" * 64, "checkpoint_dir": str(checkpoint),
         "recovery_options": {"paper_id": "local:book", "workers": 1},
     }))
     real_invalidate = pipeline.invalidate_suffix
@@ -1386,7 +1386,7 @@ def test_resume_native_passes_one_shot_call_authorization_to_build(
     tmp_path: Path, monkeypatch,
 ) -> None:
     project = tmp_path / "run"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / ("3" * 64)
     ledger_path = checkpoint / "chapters" / "ch-0001" / "translation-ledger.json"
     initialize_lane_ledger(
         ledger_path, chapter_id="ch-0001", lane="translation", segment_ids=["s1"],
@@ -1412,6 +1412,7 @@ def test_resume_native_passes_one_shot_call_authorization_to_build(
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
         "status": "needs_supervision",
+        "fingerprint": "3" * 64,
         "checkpoint_dir": str(checkpoint),
         "recovery_options": {"paper_id": "local:book", "workers": 1},
     }))
@@ -1439,7 +1440,7 @@ def test_resume_native_passes_one_shot_call_authorization_to_build(
 
 def _missing_store_native_resume_fixture(tmp_path: Path) -> dict[str, object]:
     project = tmp_path / "run"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / ("3" * 64)
     session_key = "ch-0008:guide"
     logical_key = "ch-0008:guide:companion-guide-ch-0008:generation-1"
     artifact_dir = checkpoint / "chapters" / "ch-0008" / "llm"
@@ -1506,6 +1507,7 @@ def _missing_store_native_resume_fixture(tmp_path: Path) -> dict[str, object]:
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
         "status": "needs_supervision",
+        "fingerprint": "3" * 64,
         "checkpoint_dir": str(checkpoint),
         "recovery_options": {"paper_id": "local:book", "workers": 1},
     }))
@@ -1600,7 +1602,7 @@ def test_resume_discovers_submitted_checkpoint_before_ledger_progress(
     tmp_path: Path, monkeypatch,
 ) -> None:
     project = tmp_path / "barrier-crash"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / ("3" * 64)
     chapter_id = "ch-0042"
     session_key = f"{chapter_id}:translation"
     segment_id = f"{chapter_id}.seg-0003"
@@ -1630,7 +1632,7 @@ def test_resume_discovers_submitted_checkpoint_before_ledger_progress(
     assert not (artifact_dir / "progress.jsonl").exists()
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
-        "status": "needs_supervision", "checkpoint_dir": str(checkpoint),
+        "status": "needs_supervision", "fingerprint": "3" * 64, "checkpoint_dir": str(checkpoint),
         "recovery_options": {"paper_id": "local:book", "workers": 1},
     }))
     captured = {}
@@ -1667,7 +1669,7 @@ def test_v1_complete_migration_recovers_all_17_pending_calls(
     tmp_path: Path, monkeypatch,
 ) -> None:
     project = tmp_path / "v1-seventeen"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / ("3" * 64)
     manager = LLMSessionManager(checkpoint / "sessions")
     v1_entries = []
     v1_contexts = []
@@ -1730,11 +1732,11 @@ def test_v1_complete_migration_recovers_all_17_pending_calls(
             pipeline.clear_needs_supervision(ledger_path)
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
-        "status": "needs_supervision", "checkpoint_dir": str(checkpoint),
+        "status": "needs_supervision", "fingerprint": "3" * 64, "checkpoint_dir": str(checkpoint),
         "recovery_options": {"paper_id": "local:book", "workers": 1},
     }))
     journal = project / ".arc-companion" / "resume-transaction.json"
-    journal.parent.mkdir()
+    journal.parent.mkdir(exist_ok=True)
     journal.write_text(json.dumps({
         "schema_version": "arc.companion.resume-transaction.v1",
         "action": "resume-native", "status": "complete",
@@ -1763,7 +1765,7 @@ def test_resume_native_isolates_conflicting_entry_and_resolves_other_lane(
     tmp_path: Path, monkeypatch,
 ) -> None:
     project = tmp_path / "mixed-native"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / ("3" * 64)
     manager = LLMSessionManager(checkpoint / "sessions")
     ledgers: dict[str, Path] = {}
     keys: dict[str, str] = {}
@@ -1798,7 +1800,7 @@ def test_resume_native_isolates_conflicting_entry_and_resolves_other_lane(
         )
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
-        "status": "needs_supervision", "checkpoint_dir": str(checkpoint),
+        "status": "needs_supervision", "fingerprint": "3" * 64, "checkpoint_dir": str(checkpoint),
         "recovery_options": {"paper_id": "local:book", "workers": 2},
     }))
     calls = []
@@ -1879,7 +1881,7 @@ def test_resume_native_applies_many_supervised_ledgers_idempotently(
     tmp_path: Path, monkeypatch,
 ) -> None:
     project = tmp_path / "many-supervised"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / ("3" * 64)
     manager = LLMSessionManager(checkpoint / "sessions")
     logical_keys: list[str] = []
     for index in range(1, 18):
@@ -1921,6 +1923,7 @@ def test_resume_native_applies_many_supervised_ledgers_idempotently(
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
         "status": "needs_supervision",
+        "fingerprint": "3" * 64,
         "checkpoint_dir": str(checkpoint),
         "recovery_options": {"paper_id": "local:book", "workers": 1},
     }))
@@ -2010,7 +2013,7 @@ def test_resume_native_rejects_supervision_without_logical_call_key(
     tmp_path: Path, monkeypatch,
 ) -> None:
     project = tmp_path / "run"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / ("3" * 64)
     ledger_path = checkpoint / "chapters" / "ch-0001" / "translation-ledger.json"
     initialize_lane_ledger(
         ledger_path, chapter_id="ch-0001", lane="translation", segment_ids=["s1"],
@@ -2022,6 +2025,7 @@ def test_resume_native_rejects_supervision_without_logical_call_key(
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
         "status": "needs_supervision",
+        "fingerprint": "3" * 64,
         "checkpoint_dir": str(checkpoint),
         "recovery_options": {"paper_id": "local:book", "workers": 1},
     }))

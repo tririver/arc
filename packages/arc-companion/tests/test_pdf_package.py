@@ -9,6 +9,10 @@ import zipfile
 import pytest
 
 from arc_companion import pdf as pdf_module
+from arc_companion.artifact_ids import (
+    allocate_artifact_dir,
+    render_artifact_identity,
+)
 from arc_companion.io import (
     canonical_json,
     read_json,
@@ -840,6 +844,115 @@ def test_package_accepts_current_v2_success_receipt(tmp_path: Path) -> None:
     result = package_project(tmp_path)
 
     assert result["ok"] is True
+
+
+def test_package_includes_validated_render_identity_receipt(
+    tmp_path: Path,
+) -> None:
+    _complete_project(tmp_path)
+    state_path = tmp_path / "state.json"
+    state = read_json(state_path)
+    content_sha256 = "1" * 64
+    payload = {
+        "content_sha256": content_sha256,
+        "render_recipe_sha256": pdf_render_recipe_sha256(),
+        "validator_version": PDF_VALIDATOR_VERSION,
+        "stem": "paper",
+    }
+    nonce = "7" * 32
+    identity = render_artifact_identity(
+        kind="pdf-render", payload=payload, nonce=nonce,
+    )
+    allocation = allocate_artifact_dir(
+        tmp_path / ".arc-companion" / "renders" / "pdf",
+        identity,
+        kind="pdf-render",
+        stem="paper",
+        payload=payload,
+        nonce=nonce,
+        allow_legacy=False,
+    )
+    sources = {
+        "output_pdf": Path(state["output_pdf"]),
+        "output_tex": tmp_path / "deliverables" / "paper.tex",
+        "source_manifest_path": tmp_path / "source-manifest.json",
+        "validation_path": tmp_path / "validation.json",
+    }
+    hashes = {
+        "output_pdf": "output_pdf_sha256",
+        "output_tex": "output_tex_sha256",
+        "source_manifest_path": "source_manifest_sha256",
+        "validation_path": "validation_sha256",
+    }
+    for key, source in sources.items():
+        target = allocation.path / source.name
+        source.replace(target)
+        state[key] = str(target)
+        state[hashes[key]] = sha256_file(target)
+    pdf = Path(state["output_pdf"])
+    tex = Path(state["output_tex"])
+    manifest = Path(state["source_manifest_path"])
+    validation = Path(state["validation_path"])
+    write_json(
+        validation,
+        build_pdf_validation_receipt(
+            content_sha256=content_sha256,
+            pdf_sha256=sha256_file(pdf),
+            tex_sha256=sha256_file(tex),
+            source_manifest_sha256=sha256_file(manifest),
+            pdf_report={
+                "validator": PDF_VALIDATOR_VERSION,
+                "result": "success",
+                "pages": 1,
+                "pages_checked": 1,
+                "dpi": 144,
+                "pdf_bytes": pdf.stat().st_size,
+                "text_bytes": 1,
+                "raster_bytes": 1,
+                "encrypted": False,
+                "embedded_font_count": 2,
+                "font_roles": {
+                    "sans": ["Noto Sans"],
+                    "serif": ["Latin Modern"],
+                },
+            },
+            source_credit_pdf={
+                "schema_version": (
+                    "arc.companion.source-credit-pdf-observation.v1"
+                ),
+                "canonical_sha256": "2" * 64,
+                "searchable_text_sha256": "3" * 64,
+                "ordered_ids": ["author:1"],
+                "visible_projection_sha256": "4" * 64,
+                "visible_counts": {
+                    "authors": 1,
+                    "affiliations": 0,
+                    "profiles": 0,
+                },
+            },
+        ),
+    )
+    state.update({
+        "schema_version": "arc.companion.state.v3",
+        "status": "complete",
+        "content_sha256": content_sha256,
+        "render_identity": identity,
+        "render_stem": "paper",
+        "render_identity_receipt_path": str(allocation.receipt_path),
+        "render_identity_receipt_sha256": allocation.receipt_sha256,
+        "render_recipe_sha256": pdf_render_recipe_sha256(),
+        "validator_version": PDF_VALIDATOR_VERSION,
+        "render_version": "arc.companion.final-render.v13",
+        "source_credit_sha256": "2" * 64,
+        "source_credit_observation_sha256": "4" * 64,
+        "validation_sha256": sha256_file(validation),
+    })
+    write_json(state_path, state)
+    result = package_project(tmp_path)
+    assert result["ok"] is True, result
+    with zipfile.ZipFile(result["data"]["archive_path"]) as handle:
+        names = set(handle.namelist())
+    assert allocation.receipt_path.relative_to(tmp_path).as_posix() in names
 
 
 def test_package_rejects_legacy_receipt_for_current_render(

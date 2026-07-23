@@ -543,6 +543,20 @@ directly inside the resolved `--project-dir`, not its parent. The internal
 render revision remains the authoritative `output_pdf` used by validation and
 reproducibility packaging.
 
+Checkpoint and PDF render directories use the shortest unambiguous SHA-256
+prefix (12 characters, growing by four on collision). Treat
+`directory-identity.json` and the full identity plus receipt hash recorded in
+`state.json` as authority; never infer identity from a directory basename.
+Existing full-64 checkpoint directories remain readable in place. The
+workers-to-total-budget migration records a strict alias receipt and never
+renames the old checkpoint. Prefixes improve scanability and path length; they
+do not reduce retained content, disk usage, or model context. In the measured
+Barthes companion run, checkpoint data remained about 42 MB and immutable
+render revisions about 381 MB; evidence, translation, and version stores from
+the surrounding workflows retain their own sizes. Content objects, accepted
+artifacts, provider call checkpoints, sessions, segments, and other
+content-addressed records keep their full 64-character identities.
+
 Create a reproducibility package only when explicitly requested:
 
 ```bash

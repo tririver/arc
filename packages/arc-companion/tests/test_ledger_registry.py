@@ -257,7 +257,10 @@ def test_auto_rejects_preexisting_transaction_bound_to_unregistered_legacy_ledge
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
-    checkpoint = project / "checkpoint"
+    fingerprint = "a" * 64
+    checkpoint = (
+        project / ".arc-companion" / "checkpoints" / fingerprint
+    )
     source = _create_registered(tmp_path / "source-checkpoint")
     rogue = _ledger_path(checkpoint, "ch-legacy")
     rogue.parent.mkdir(parents=True)
@@ -267,7 +270,7 @@ def test_auto_rejects_preexisting_transaction_bound_to_unregistered_legacy_ledge
     (project / "state.json").write_text(json.dumps({
         "status": "needs_supervision",
         "checkpoint_dir": str(checkpoint),
-        "fingerprint": checkpoint.name,
+        "fingerprint": fingerprint,
         "recovery_options": {"paper_id": "local:test", "workers": 1},
     }), encoding="utf-8")
     begin_transaction(
@@ -281,7 +284,7 @@ def test_auto_rejects_preexisting_transaction_bound_to_unregistered_legacy_ledge
             "initial_generation": 1,
         }],
         checkpoint_path=checkpoint,
-        checkpoint_fingerprint=checkpoint.name,
+        checkpoint_fingerprint=fingerprint,
     )
 
     result = pipeline._resume_companion_unlocked(project, action="auto")

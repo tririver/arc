@@ -17,6 +17,29 @@ from arc_companion.source import SourceError
 from arc_llm.sessions import LLMSessionManager
 
 
+BUILD_FINGERPRINT = "2" * 64
+
+
+def test_resume_returns_structured_error_for_invalid_checkpoint_state(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "invalid-run"
+    project.mkdir()
+    (project / "state.json").write_text(json.dumps({
+        "status": "failed",
+        "fingerprint": BUILD_FINGERPRINT,
+        "checkpoint_dir": str(tmp_path / "outside"),
+    }), encoding="utf-8")
+
+    result = pipeline._resume_companion_unlocked(
+        project,
+        action="auto",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "companion_checkpoint_invalid"
+
+
 def _project(
     tmp_path: Path,
     *,
@@ -24,7 +47,7 @@ def _project(
     commentary_segments: tuple[str, ...] = ("s1", "s2", "s3"),
 ) -> tuple[Path, Path, Path, Path, LLMSessionManager]:
     project = tmp_path / "run"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / BUILD_FINGERPRINT
     translation = checkpoint / "chapters" / "ch-0001" / "translation-ledger.json"
     commentary = checkpoint / "chapters" / "ch-0001" / "companion-ledger.json"
     initialize_lane_ledger(
@@ -50,6 +73,7 @@ def _project(
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
         "status": "needs_supervision",
+        "fingerprint": BUILD_FINGERPRINT,
         "checkpoint_dir": str(checkpoint),
         "recovery_options": {
             "paper_id": "local:auto-recovery",

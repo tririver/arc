@@ -4,6 +4,10 @@ from datetime import datetime, timezone
 import json
 
 from arc_companion.observability import append_state_event, enrich_status
+from arc_companion.artifact_ids import allocate_artifact_dir
+
+
+OBS_FINGERPRINT = "a" * 64
 from arc_companion.run_lock import ProjectBuildLock, inspect_lock
 
 
@@ -47,14 +51,14 @@ def test_lock_diagnostics_include_owner_start_and_live_identity(tmp_path) -> Non
 
 
 def test_status_reports_wait_reason_call_counts_and_phase_timings(tmp_path) -> None:
-    checkpoint = tmp_path / "checkpoint"
+    checkpoint = tmp_path / ".arc-companion" / "checkpoints" / OBS_FINGERPRINT
     call_path = checkpoint / "chapter" / "call-checkpoints" / "call.json"
     call_path.parent.mkdir(parents=True)
     call_path.write_text(json.dumps({"state": "submitted"}), encoding="utf-8")
     state_path = tmp_path / "state.json"
     state = {
         "status": "generating",
-        "checkpoint_dir": str(checkpoint),
+        "fingerprint": OBS_FINGERPRINT, "checkpoint_dir": str(checkpoint),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     append_state_event(state_path, state)
@@ -100,7 +104,7 @@ def test_terminal_phase_elapsed_does_not_grow_after_completion(tmp_path) -> None
 
 
 def test_status_merges_unresolved_resume_transaction_entries(tmp_path) -> None:
-    checkpoint = tmp_path / "checkpoint"
+    checkpoint = tmp_path / ".arc-companion" / "checkpoints" / OBS_FINGERPRINT
     ledger_dir = checkpoint / "production" / "lanes"
     ledger_dir.mkdir(parents=True)
     entries = []
@@ -156,14 +160,14 @@ def test_status_merges_unresolved_resume_transaction_entries(tmp_path) -> None:
                 ),
             }))
     transaction_path = tmp_path / ".arc-companion" / "resume-transaction.json"
-    transaction_path.parent.mkdir()
+    transaction_path.parent.mkdir(exist_ok=True)
     transaction_path.write_text(json.dumps({
         "schema_version": "arc.companion.resume-transaction.v2",
         "action": "resume-native", "status": "continuation_failed",
         "entries": entries,
         "native_resume_contexts": native_contexts,
     }))
-    state = {"status": "needs_supervision", "checkpoint_dir": str(checkpoint)}
+    state = {"status": "needs_supervision", "fingerprint": OBS_FINGERPRINT, "checkpoint_dir": str(checkpoint)}
 
     result = enrich_status(tmp_path, state)
 
@@ -186,7 +190,7 @@ def test_status_merges_unresolved_resume_transaction_entries(tmp_path) -> None:
 
 
 def test_status_reports_automatic_replacement_provenance(tmp_path) -> None:
-    checkpoint = tmp_path / "checkpoint"
+    checkpoint = tmp_path / ".arc-companion" / "checkpoints" / OBS_FINGERPRINT
     ledger = checkpoint / "translation-ledger.json"
     ledger.parent.mkdir(parents=True)
     ledger.write_text(json.dumps({
@@ -197,7 +201,7 @@ def test_status_reports_automatic_replacement_provenance(tmp_path) -> None:
         }],
     }))
     journal = tmp_path / ".arc-companion" / "resume-transaction.json"
-    journal.parent.mkdir()
+    journal.parent.mkdir(exist_ok=True)
     journal.write_text(json.dumps({
         "schema_version": "arc.companion.resume-transaction.v2",
         "action": "auto", "policy": "auto", "status": "continuing",
@@ -224,7 +228,7 @@ def test_status_reports_automatic_replacement_provenance(tmp_path) -> None:
     }))
 
     result = enrich_status(
-        tmp_path, {"status": "needs_supervision", "checkpoint_dir": str(checkpoint)},
+        tmp_path, {"status": "needs_supervision", "fingerprint": OBS_FINGERPRINT, "checkpoint_dir": str(checkpoint)},
     )
 
     assert result["recovery_policy"] == "auto"
@@ -244,7 +248,7 @@ def test_status_reports_automatic_replacement_provenance(tmp_path) -> None:
 
 
 def test_status_reports_typed_fresh_generation_without_response_or_prompt(tmp_path) -> None:
-    checkpoint = tmp_path / "checkpoint"
+    checkpoint = tmp_path / ".arc-companion" / "checkpoints" / OBS_FINGERPRINT
     ledger = checkpoint / "translation-ledger.json"
     ledger.parent.mkdir(parents=True)
     ledger.write_text(json.dumps({
@@ -261,7 +265,7 @@ def test_status_reports_typed_fresh_generation_without_response_or_prompt(tmp_pa
         ],
     }))
     journal = tmp_path / ".arc-companion" / "resume-transaction.json"
-    journal.parent.mkdir()
+    journal.parent.mkdir(exist_ok=True)
     journal.write_text(json.dumps({
         "schema_version": "arc.companion.resume-transaction.v3",
         "action": "auto", "policy": "auto", "status": "continuing",
@@ -282,7 +286,7 @@ def test_status_reports_typed_fresh_generation_without_response_or_prompt(tmp_pa
     }))
 
     result = enrich_status(
-        tmp_path, {"status": "needs_supervision", "checkpoint_dir": str(checkpoint)},
+        tmp_path, {"status": "needs_supervision", "fingerprint": OBS_FINGERPRINT, "checkpoint_dir": str(checkpoint)},
     )
 
     pending = result["pending_calls"][0]
@@ -296,7 +300,7 @@ def test_status_reports_typed_fresh_generation_without_response_or_prompt(tmp_pa
 
 
 def test_resolved_transaction_entry_hides_stale_failed_checkpoint(tmp_path) -> None:
-    checkpoint = tmp_path / "checkpoint"
+    checkpoint = tmp_path / ".arc-companion" / "checkpoints" / OBS_FINGERPRINT
     ledger = checkpoint / "translation-ledger.json"
     call_path = checkpoint / "llm" / "call-checkpoints" / "call.json"
     call_path.parent.mkdir(parents=True)
@@ -308,7 +312,7 @@ def test_resolved_transaction_entry_hides_stale_failed_checkpoint(tmp_path) -> N
         ),
     }))
     journal = tmp_path / ".arc-companion" / "resume-transaction.json"
-    journal.parent.mkdir()
+    journal.parent.mkdir(exist_ok=True)
     journal.write_text(json.dumps({
         "schema_version": "arc.companion.resume-transaction.v2",
         "action": "auto", "policy": "auto", "status": "complete",
@@ -321,7 +325,7 @@ def test_resolved_transaction_entry_hides_stale_failed_checkpoint(tmp_path) -> N
     }))
 
     result = enrich_status(
-        tmp_path, {"status": "complete", "checkpoint_dir": str(checkpoint)},
+        tmp_path, {"status": "complete", "fingerprint": OBS_FINGERPRINT, "checkpoint_dir": str(checkpoint)},
     )
 
     assert result["pending_call_count"] == 0
@@ -329,7 +333,7 @@ def test_resolved_transaction_entry_hides_stale_failed_checkpoint(tmp_path) -> N
 
 
 def test_status_never_correlates_shared_key_across_session_or_generation(tmp_path) -> None:
-    checkpoint = tmp_path / "checkpoint"
+    checkpoint = tmp_path / ".arc-companion" / "checkpoints" / OBS_FINGERPRINT
     calls = checkpoint / "llm" / "call-checkpoints"
     calls.mkdir(parents=True)
     for name, session, generation in (
@@ -345,7 +349,7 @@ def test_status_never_correlates_shared_key_across_session_or_generation(tmp_pat
             ),
         }))
     journal = tmp_path / ".arc-companion" / "resume-transaction.json"
-    journal.parent.mkdir()
+    journal.parent.mkdir(exist_ok=True)
     journal.write_text(json.dumps({
         "action": "auto", "status": "complete", "entries": [{
             "ledger_path": str(checkpoint / "a-ledger.json"),
@@ -356,7 +360,7 @@ def test_status_never_correlates_shared_key_across_session_or_generation(tmp_pat
     }))
 
     result = enrich_status(
-        tmp_path, {"status": "complete", "checkpoint_dir": str(checkpoint)},
+        tmp_path, {"status": "complete", "fingerprint": OBS_FINGERPRINT, "checkpoint_dir": str(checkpoint)},
     )
 
     assert result["pending_call_count"] == 1
@@ -365,7 +369,7 @@ def test_status_never_correlates_shared_key_across_session_or_generation(tmp_pat
 
 
 def test_status_requires_matching_control_address_and_logical_unit(tmp_path) -> None:
-    checkpoint = tmp_path / "checkpoint"
+    checkpoint = tmp_path / ".arc-companion" / "checkpoints" / OBS_FINGERPRINT
     calls = checkpoint / "llm" / "call-checkpoints"
     calls.mkdir(parents=True)
     key = "same-logical-key"
@@ -382,7 +386,7 @@ def test_status_requires_matching_control_address_and_logical_unit(tmp_path) -> 
             ),
         }))
     journal = tmp_path / ".arc-companion" / "resume-transaction.json"
-    journal.parent.mkdir()
+    journal.parent.mkdir(exist_ok=True)
     journal.write_text(json.dumps({
         "action": "auto", "status": "complete", "entries": [{
             "ledger_path": str(checkpoint / "owned-ledger.json"),
@@ -393,7 +397,7 @@ def test_status_requires_matching_control_address_and_logical_unit(tmp_path) -> 
     }))
 
     result = enrich_status(
-        tmp_path, {"status": "complete", "checkpoint_dir": str(checkpoint)},
+        tmp_path, {"status": "complete", "fingerprint": OBS_FINGERPRINT, "checkpoint_dir": str(checkpoint)},
     )
 
     assert result["pending_call_count"] == 2
@@ -413,11 +417,11 @@ def test_status_requires_matching_control_address_and_logical_unit(tmp_path) -> 
 def test_action_history_projects_safe_fields_and_recursively_redacts_reasons(
     tmp_path,
 ) -> None:
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
+    checkpoint = tmp_path / ".arc-companion" / "checkpoints" / OBS_FINGERPRINT
+    checkpoint.mkdir(parents=True)
     secret = "sk-abcdefghijklmnop"
     journal = tmp_path / ".arc-companion" / "resume-transaction.json"
-    journal.parent.mkdir()
+    journal.parent.mkdir(exist_ok=True)
     journal.write_text(json.dumps({
         "action": "auto", "action_history": [{
             "action": "auto", "policy": "auto",
@@ -432,7 +436,7 @@ def test_action_history_projects_safe_fields_and_recursively_redacts_reasons(
     }))
 
     result = enrich_status(
-        tmp_path, {"status": "needs_supervision", "checkpoint_dir": str(checkpoint)},
+        tmp_path, {"status": "needs_supervision", "fingerprint": OBS_FINGERPRINT, "checkpoint_dir": str(checkpoint)},
     )
 
     history = result["recovery_action_history"]
@@ -446,7 +450,7 @@ def test_action_history_projects_safe_fields_and_recursively_redacts_reasons(
 
 
 def test_status_redacts_and_bounds_controller_and_provider_reasons(tmp_path) -> None:
-    checkpoint = tmp_path / "checkpoint"
+    checkpoint = tmp_path / ".arc-companion" / "checkpoints" / OBS_FINGERPRINT
     call = checkpoint / "llm" / "call-checkpoints" / "call.json"
     call.parent.mkdir(parents=True)
     secret = "sk-abcdefghijklmnop"
@@ -456,10 +460,140 @@ def test_status_redacts_and_bounds_controller_and_provider_reasons(tmp_path) -> 
     }))
 
     result = enrich_status(
-        tmp_path, {"status": "needs_supervision", "checkpoint_dir": str(checkpoint)},
+        tmp_path, {"status": "needs_supervision", "fingerprint": OBS_FINGERPRINT, "checkpoint_dir": str(checkpoint)},
     )
 
     reason = result["pending_calls"][0]["blocking_reason"]
     assert secret not in reason
     assert "[REDACTED]" in reason
     assert len(reason) == 4096
+
+
+def test_status_does_not_traverse_external_checkpoint_state(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path.parent / f"{tmp_path.name}-external-checkpoint"
+    call = external / "call-checkpoints" / "call.json"
+    call.parent.mkdir(parents=True)
+    call.write_text(json.dumps({"state": "submitted"}), encoding="utf-8")
+    result = enrich_status(
+        tmp_path,
+        {
+            "status": "generating",
+            "fingerprint": OBS_FINGERPRINT,
+            "checkpoint_dir": str(external),
+        },
+    )
+    assert result["calls"]["active"] == 0
+    assert result["pending_call_count"] == 0
+
+
+def test_status_resolves_short_checkpoint_and_rejects_identity_conflict(
+    tmp_path: Path,
+) -> None:
+    allocation = allocate_artifact_dir(
+        tmp_path / ".arc-companion" / "checkpoints",
+        OBS_FINGERPRINT,
+        kind="checkpoint",
+    )
+    call = (
+        allocation.path / "call-checkpoints" / "call.json"
+    )
+    call.parent.mkdir()
+    call.write_text(json.dumps({"state": "submitted"}), encoding="utf-8")
+    state = {
+        "status": "generating",
+        "fingerprint": OBS_FINGERPRINT,
+        "checkpoint_identity": OBS_FINGERPRINT,
+        "checkpoint_dir": str(allocation.path),
+        "checkpoint_identity_receipt_path": str(
+            allocation.receipt_path
+        ),
+        "checkpoint_identity_receipt_sha256": (
+            allocation.receipt_sha256
+        ),
+    }
+    assert enrich_status(tmp_path, state)["calls"]["active"] == 1
+    conflicted = {**state, "checkpoint_identity": "b" * 64}
+    assert enrich_status(tmp_path, conflicted)["calls"]["active"] == 0
+
+
+def test_status_accepts_checkpoint_identity_only_transition(
+    tmp_path: Path,
+) -> None:
+    allocation = allocate_artifact_dir(
+        tmp_path / ".arc-companion" / "checkpoints",
+        OBS_FINGERPRINT,
+        kind="checkpoint",
+    )
+    call = allocation.path / "call-checkpoints" / "call.json"
+    call.parent.mkdir()
+    call.write_text(json.dumps({"state": "submitted"}), encoding="utf-8")
+    state = {
+        "status": "generating",
+        "checkpoint_identity": OBS_FINGERPRINT,
+        "checkpoint_dir": str(allocation.path),
+        "checkpoint_identity_receipt_path": str(
+            allocation.receipt_path
+        ),
+        "checkpoint_identity_receipt_sha256": (
+            allocation.receipt_sha256
+        ),
+    }
+    assert enrich_status(tmp_path, state)["calls"]["active"] == 1
+
+
+def test_status_accepts_durable_intent_guidance_recovery_root(
+    tmp_path: Path,
+) -> None:
+    fingerprint = "c" * 64
+    checkpoint = (
+        tmp_path / ".arc-companion" / "intent-guidance" / ("d" * 64)
+    )
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "source-snapshot-receipt.json").write_text(
+        json.dumps({
+            "schema_version": (
+                "arc.companion.source-snapshot-receipt.v2"
+            ),
+            "fingerprint": fingerprint,
+            "checkpoint_identity": fingerprint,
+        }),
+        encoding="utf-8",
+    )
+    call = checkpoint / "call-checkpoints" / "call.json"
+    call.parent.mkdir()
+    call.write_text(json.dumps({"state": "submitted"}), encoding="utf-8")
+    state = {
+        "status": "failed",
+        "checkpoint_dir": str(checkpoint),
+        "recovery_root_kind": "intent-guidance",
+        "recovery_root_fingerprint": fingerprint,
+    }
+    assert enrich_status(tmp_path, state)["calls"]["active"] == 1
+
+
+def test_status_rejects_saved_receipt_symlink_even_when_target_is_valid(
+    tmp_path: Path,
+) -> None:
+    allocation = allocate_artifact_dir(
+        tmp_path / ".arc-companion" / "checkpoints",
+        OBS_FINGERPRINT,
+        kind="checkpoint",
+    )
+    call = allocation.path / "call-checkpoints" / "call.json"
+    call.parent.mkdir()
+    call.write_text(json.dumps({"state": "submitted"}), encoding="utf-8")
+    saved_receipt = tmp_path / "outside-receipt-link"
+    saved_receipt.symlink_to(allocation.receipt_path)
+    state = {
+        "status": "generating",
+        "fingerprint": OBS_FINGERPRINT,
+        "checkpoint_identity": OBS_FINGERPRINT,
+        "checkpoint_dir": str(allocation.path),
+        "checkpoint_identity_receipt_path": str(saved_receipt),
+        "checkpoint_identity_receipt_sha256": (
+            allocation.receipt_sha256
+        ),
+    }
+    assert enrich_status(tmp_path, state)["calls"]["active"] == 0

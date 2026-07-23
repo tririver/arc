@@ -414,6 +414,17 @@ remains authoritative for validation and packaging. Do not list internal JSON,
 TeX, logs, ledgers, or citation data unless requested. Create a reproducibility
 package only on explicit request:
 
+Internal checkpoint and render directory names are display prefixes, not
+identities. Resolve them through `directory-identity.json` and the matching
+full identity and receipt hash in `state.json`; legacy full-64 checkpoint
+directories are read in place, and worker-budget migration uses an alias
+receipt rather than a rename. This shortens only directory display names:
+content objects, accepted artifacts, calls, sessions, and segments retain
+full-64 identities and no research or model context is discarded. It is a
+readability/path-length change, not disk compression: the measured Barthes run
+still retained about 42 MB of checkpoints and 381 MB of immutable renders,
+while evidence, translation, and version stores retained their own sizes.
+
 ```bash
 arc-companion package --project-dir <project-dir> --json
 ```

@@ -27,6 +27,7 @@ from arc_llm.sessions import LLMSessionManager
 
 
 SESSION_KEY = "ch-0001:translation"
+BUILD_FINGERPRINT = "1" * 64
 FAKE_KIMI = (
     Path(__file__).parents[2] / "arc-llm" / "tests" / "fixtures" / "fake_kimi_acp.py"
 )
@@ -34,7 +35,7 @@ FAKE_KIMI = (
 
 def _project(tmp_path: Path) -> tuple[Path, Path, Path, LLMSessionManager]:
     project = tmp_path / "run"
-    checkpoint = project / "checkpoint"
+    checkpoint = project / ".arc-companion" / "checkpoints" / BUILD_FINGERPRINT
     ledger_path = checkpoint / "chapters" / "ch-0001" / "translation-ledger.json"
     initialize_lane_ledger(
         ledger_path,
@@ -53,6 +54,7 @@ def _project(tmp_path: Path) -> tuple[Path, Path, Path, LLMSessionManager]:
     project.mkdir(parents=True, exist_ok=True)
     (project / "state.json").write_text(json.dumps({
         "status": "needs_supervision",
+        "fingerprint": BUILD_FINGERPRINT,
         "checkpoint_dir": str(checkpoint),
         "recovery_options": {
             "paper_id": "local:auto-native-multi",

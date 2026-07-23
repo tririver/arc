@@ -8,6 +8,10 @@ from typing import Any
 import pytest
 
 import arc_companion.pipeline as pipeline
+from arc_companion.artifact_ids import (
+    allocate_artifact_dir,
+    ensure_artifact_alias_receipt,
+)
 from arc_companion.pipeline import BuildOptions
 from arc_companion.io import sha256_json
 from arc_companion.paper_broker import (
@@ -69,7 +73,9 @@ def _snapshot_fixture(tmp_path: Path) -> tuple[
         evidence=pipeline._evidence(bundle),
         domain_context=None,
     )
-    checkpoint = project / "checkpoints" / fingerprint
+    checkpoint = (
+        project / ".arc-companion" / "checkpoints" / fingerprint
+    )
     checkpoint.mkdir(parents=True)
     (checkpoint / "document.json").write_text(
         json.dumps(payload), encoding="utf-8",
@@ -82,6 +88,138 @@ def _snapshot_fixture(tmp_path: Path) -> tuple[
 
 def _failing_source_loader(*_args, **_kwargs):
     raise SourceError("authoritative source cache is unavailable")
+
+
+def test_checkpoint_state_resolver_accepts_strict_worker_alias(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "alias-run"
+    root = project / ".arc-companion" / "checkpoints"
+    logical = "d" * 64
+    physical = "e" * 64
+    checkpoint = root / physical
+    checkpoint.mkdir(parents=True)
+    alias = ensure_artifact_alias_receipt(
+        root,
+        logical,
+        {
+            "schema_version": "arc.companion.checkpoint-alias.v1",
+            "kind": "workers-to-total-concurrency-budget",
+            "alias_identity": logical,
+            "legacy_fingerprint": physical,
+            "content_fingerprint": logical,
+            "legacy_checkpoint_dir": str(checkpoint),
+            "legacy_workers_per_lane": 4097,
+        },
+    )
+    state = {
+        "fingerprint": logical,
+        "checkpoint_identity": logical,
+        "checkpoint_dir": str(checkpoint),
+        "checkpoint_alias_identity": logical,
+        "checkpoint_alias_receipt_path": str(alias.path),
+        "checkpoint_alias_receipt_sha256": alias.sha256,
+    }
+    resolved = pipeline._resolve_checkpoint_state_identity(
+        project, state, checkpoint,
+    )
+    assert resolved.path == checkpoint.resolve()
+    assert resolved.identity == physical
+
+
+def test_checkpoint_state_rejects_external_identity_receipt_symlink(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "identity-run"
+    identity = "a" * 64
+    allocation = allocate_artifact_dir(
+        project / ".arc-companion" / "checkpoints",
+        identity,
+        kind="checkpoint",
+    )
+    saved = tmp_path / "identity-receipt-link"
+    saved.symlink_to(allocation.receipt_path)
+    state = {
+        "fingerprint": identity,
+        "checkpoint_identity": identity,
+        "checkpoint_dir": str(allocation.path),
+        "checkpoint_identity_receipt_path": str(saved),
+        "checkpoint_identity_receipt_sha256": allocation.receipt_sha256,
+    }
+    with pytest.raises(RuntimeError, match="receipt state"):
+        pipeline._resolve_checkpoint_state_identity(
+            project, state, allocation.path,
+        )
+
+
+def test_checkpoint_state_rejects_external_alias_receipt_symlink(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "alias-link-run"
+    root = project / ".arc-companion" / "checkpoints"
+    logical = "b" * 64
+    physical = "c" * 64
+    checkpoint = root / physical
+    checkpoint.mkdir(parents=True)
+    alias = ensure_artifact_alias_receipt(
+        root,
+        logical,
+        {
+            "schema_version": "arc.companion.checkpoint-alias.v1",
+            "kind": "workers-to-total-concurrency-budget",
+            "alias_identity": logical,
+            "legacy_fingerprint": physical,
+            "content_fingerprint": logical,
+            "legacy_checkpoint_dir": str(checkpoint),
+            "legacy_workers_per_lane": 4097,
+        },
+    )
+    saved = tmp_path / "alias-receipt-link"
+    saved.symlink_to(alias.path)
+    state = {
+        "fingerprint": logical,
+        "checkpoint_identity": logical,
+        "checkpoint_dir": str(checkpoint),
+        "checkpoint_alias_identity": logical,
+        "checkpoint_alias_receipt_path": str(saved),
+        "checkpoint_alias_receipt_sha256": alias.sha256,
+    }
+    with pytest.raises(RuntimeError, match="alias receipt state"):
+        pipeline._resolve_checkpoint_state_identity(
+            project, state, checkpoint,
+        )
+
+
+def test_intent_guidance_recovery_root_has_separate_safe_authority(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "intent-run"
+    fingerprint = "f" * 64
+    root = (
+        project / ".arc-companion" / "intent-guidance" / ("1" * 64)
+    )
+    root.mkdir(parents=True)
+    (root / "source-snapshot-receipt.json").write_text(
+        json.dumps({
+            "schema_version": "arc.companion.source-snapshot-receipt.v2",
+            "fingerprint": fingerprint,
+            "checkpoint_identity": fingerprint,
+        }),
+        encoding="utf-8",
+    )
+    state = {
+        "status": "failed",
+        "checkpoint_dir": str(root),
+        "recovery_root_kind": "intent-guidance",
+        "recovery_root_fingerprint": fingerprint,
+    }
+    assert pipeline._resolve_recovery_state_root(
+        project, state, root,
+    ) == root.resolve()
+    with pytest.raises(RuntimeError, match="intent-guidance"):
+        pipeline._resolve_recovery_state_root(
+            project, state, tmp_path,
+        )
 
 
 class _ReferenceBroker:
@@ -267,7 +405,9 @@ def _reference_snapshot_fixture(
         domain_context=None,
         translation_reference_manifest_sha256=reference.manifest_sha256,
     )
-    checkpoint = project / "checkpoints" / fingerprint
+    checkpoint = (
+        project / ".arc-companion" / "checkpoints" / fingerprint
+    )
     checkpoint.mkdir(parents=True)
     for name, value in (
         ("document.json", payload),
@@ -529,7 +669,7 @@ def test_failed_state_without_checkpoint_pointer_recovers_root_from_transaction_
         "fingerprint": fingerprint,
     }), encoding="utf-8")
     journal = options.project_dir / ".arc-companion" / "resume-transaction.json"
-    journal.parent.mkdir(parents=True)
+    journal.parent.mkdir(parents=True, exist_ok=True)
     journal.write_text(json.dumps({
         "schema_version": "arc.companion.resume-transaction.v2",
         "action": "auto",

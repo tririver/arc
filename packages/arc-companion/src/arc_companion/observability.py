@@ -68,11 +68,9 @@ def enrich_status(project_dir: Path, state: Mapping[str, Any]) -> dict[str, Any]
 
 
 def _call_counts(root: Path, state: Mapping[str, Any]) -> dict[str, int]:
-    checkpoint = Path(str(state.get("checkpoint_dir") or ""))
-    if not checkpoint.is_absolute():
-        checkpoint = root / checkpoint
+    checkpoint = _verified_checkpoint(root, state)
     counts = {"active": 0, "queued": 0, "draining": 0}
-    if not checkpoint.is_dir():
+    if checkpoint is None or not checkpoint.is_dir():
         return counts
     for path in checkpoint.rglob("call-checkpoints/*.json"):
         try:
@@ -92,9 +90,9 @@ def _call_counts(root: Path, state: Mapping[str, Any]) -> dict[str, int]:
 def _pending_calls(root: Path, state: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Merge durable calls and transactions only through one exact control identity."""
 
-    checkpoint = Path(str(state.get("checkpoint_dir") or ""))
-    if not checkpoint.is_absolute():
-        checkpoint = root / checkpoint
+    checkpoint = _verified_checkpoint(root, state)
+    if checkpoint is None:
+        return []
     result_by_identity: dict[tuple[object, ...], dict[str, Any]] = {}
     checkpoints_by_identity: dict[
         tuple[str, str, str, int, str], tuple[Path, dict[str, Any]]
@@ -621,10 +619,8 @@ def _phase_timings(root: Path) -> tuple[dict[str, float], str | None]:
 
 
 def _latest_provider_progress(root: Path, state: Mapping[str, Any]) -> str | None:
-    checkpoint = Path(str(state.get("checkpoint_dir") or ""))
-    if not checkpoint.is_absolute():
-        checkpoint = root / checkpoint
-    if not checkpoint.is_dir():
+    checkpoint = _verified_checkpoint(root, state)
+    if checkpoint is None or not checkpoint.is_dir():
         return None
     latest: datetime | None = None
     for path in checkpoint.rglob("progress.jsonl"):
@@ -642,6 +638,32 @@ def _latest_provider_progress(root: Path, state: Mapping[str, Any]) -> str | Non
                 latest = stamp
             break
     return latest.isoformat() if latest else None
+
+
+def _verified_checkpoint(
+    root: Path, state: Mapping[str, Any],
+) -> Path | None:
+    """Return only the same bounded recovery root accepted by the pipeline."""
+
+    active_run = state.get("active_run")
+    active_run = active_run if isinstance(active_run, Mapping) else {}
+    raw_value = (
+        state.get("checkpoint_dir")
+        if "checkpoint_dir" in state
+        else active_run.get("checkpoint_dir")
+    )
+    if not isinstance(raw_value, str) or not raw_value:
+        return None
+    raw = Path(raw_value)
+    candidate = raw if raw.is_absolute() else root / raw
+    try:
+        # Runtime import avoids an import cycle while keeping status and
+        # observability on one recovery-root authority implementation.
+        from .pipeline import _resolve_recovery_state_root
+
+        return _resolve_recovery_state_root(root, state, candidate)
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _wait_reason(phase: str, calls: Mapping[str, int], lock_owner: Mapping[str, Any] | None) -> str | None:

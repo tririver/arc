@@ -14,6 +14,11 @@ from .content import (
     load_reader_content,
     migrate_legacy_reader_content,
 )
+from .artifact_ids import (
+    ARTIFACT_ID_RECEIPT_NAME,
+    allocate_artifact_dir,
+    render_artifact_identity,
+)
 from .io import (
     read_json,
     safe_name,
@@ -426,14 +431,42 @@ def render_pdf_content_unlocked(
     if fidelity_errors:
         raise LatexError("source fidelity validation failed: " + "; ".join(fidelity_errors))
     stem = f"{safe_name(str(state.get('paper_id') or 'paper'))}_companion_{safe_name(content['language'])}"
+    directory_stem = safe_name(stem)[:48].strip("-_") or "companion"
     # Every successful render is published at a new immutable path.  Therefore
     # no sequence of file replacements can damage the revision referenced by
     # the current state if this render fails before its single state commit.
-    render_dir = (
-        root / ".arc-companion" / "renders" / "pdf"
-        / f"{content_sha256}-{uuid.uuid4().hex[:12]}"
+    render_validator_version = (
+        PDF_VALIDATOR_VERSION
+        if pdf_validator is validate_pdf else "custom-validator"
     )
-    render_dir.mkdir(parents=True, exist_ok=False)
+    for _identity_attempt in range(8):
+        render_nonce = uuid.uuid4().hex
+        render_payload = {
+            "content_sha256": content_sha256,
+            "render_recipe_sha256": pdf_render_recipe_sha256(),
+            "validator_version": render_validator_version,
+            "stem": directory_stem,
+        }
+        render_identity = render_artifact_identity(
+            kind="pdf-render",
+            payload=render_payload,
+            nonce=render_nonce,
+        )
+        render_allocation = allocate_artifact_dir(
+            root / ".arc-companion" / "renders" / "pdf",
+            render_identity,
+            kind="pdf-render",
+            stem=directory_stem,
+            payload=render_payload,
+            nonce=render_nonce,
+            allow_legacy=False,
+        )
+        if render_allocation.disposition == "created":
+            break
+    else:
+        raise LatexError("could not allocate a fresh PDF render identity")
+    render_dir = render_allocation.path
+    render_identity_receipt = render_dir / ARTIFACT_ID_RECEIPT_NAME
     tex_path = render_dir / f"{stem}.tex"
     pdf_path = render_dir / f"{stem}.pdf"
     manifest_path = render_dir / "source-manifest.json"
@@ -551,19 +584,25 @@ def render_pdf_content_unlocked(
                 validation_path,
             ):
                 path.unlink(missing_ok=True)
-            try:
-                render_dir.rmdir()
-            except OSError:
-                pass
+            if render_allocation.disposition == "created":
+                render_identity_receipt.unlink(missing_ok=True)
+                try:
+                    render_dir.rmdir()
+                except OSError:
+                    pass
         raise
     return {
         "content_sha256": content_sha256,
+        "render_identity": render_identity,
+        "render_stem": directory_stem,
+        "render_identity_receipt_path": str(render_identity_receipt),
+        "render_identity_receipt_sha256": sha256_file(
+            render_identity_receipt
+        ),
         "render_version": PDF_RENDER_VERSION,
         "render_recipe_sha256": pdf_render_recipe_sha256(),
         "validator_version": (
-            PDF_VALIDATOR_VERSION
-            if pdf_validator is validate_pdf
-            else "custom-validator"
+            render_validator_version
         ),
         "output_tex": str(tex_path),
         "output_tex_sha256": expected_hashes["output_tex_sha256"],

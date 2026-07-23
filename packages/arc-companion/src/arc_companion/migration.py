@@ -6,6 +6,11 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .artifact_ids import (
+    ARTIFACT_ID_RECEIPT_NAME,
+    ArtifactIdError,
+    resolve_artifact_dir,
+)
 from .artifact_store import AcceptedArtifactStore, ArtifactStoreError, canonical_sha256
 from .content import (
     ContentBundleError,
@@ -193,7 +198,14 @@ def import_accepted_checkpoint_objects(
             "provider_calls": 0,
             "receipts": receipts,
         }
-    for checkpoint in sorted(path for path in checkpoint_root.iterdir() if path.is_dir()):
+    for checkpoint in sorted(
+        path for path in checkpoint_root.iterdir()
+        if path.is_dir() and not path.is_symlink() and path.name != "aliases"
+    ):
+        try:
+            _checkpoint_full_identity(checkpoint_root, checkpoint)
+        except ArtifactIdError:
+            continue
         metadata = _optional_object(checkpoint / "migration-metadata.json")
         recipe_sha = canonical_sha256({
             "legacy_checkpoint_recipe": {
@@ -216,7 +228,9 @@ def import_accepted_checkpoint_objects(
         review_path = checkpoint / "chapter-review.json"
         if review_path.is_file() and not overlays:
             receipts.append({
-                "checkpoint": checkpoint.name,
+                "checkpoint": _checkpoint_full_identity(
+                    checkpoint_root, checkpoint,
+                ),
                 "lane": "review",
                 "accepted": False,
                 "reason": "review_response_unbound_to_base_artifacts",
@@ -256,7 +270,9 @@ def _import_accepted_ledger(
     legacy_lane = str(ledger.get("lane") or "")
     lane = "commentary" if legacy_lane == "companion" else legacy_lane
     base = {
-        "checkpoint": checkpoint.name,
+        "checkpoint": _checkpoint_full_identity(
+            checkpoint.parent, checkpoint,
+        ),
         "chapter_id": str(ledger.get("chapter_id") or ledger_path.parent.name),
         "lane": lane,
         "ledger_path": str(ledger_path),
@@ -314,7 +330,11 @@ def _import_accepted_ledger(
                     "call_id": str(
                         (block.get("logical_receipt") or {}).get("idempotency_key")
                         or (block.get("logical_receipt") or {}).get("call_id")
-                        or f"legacy:{checkpoint.name}:{lane}:{segment_id}"
+                        or (
+                            "legacy:"
+                            f"{_checkpoint_full_identity(checkpoint.parent, checkpoint)}"
+                            f":{lane}:{segment_id}"
+                        )
                     ),
                     "usage": {"availability": "not_recorded_in_legacy_checkpoint"},
                 },
@@ -400,13 +420,36 @@ def _optional_object(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _checkpoint_full_identity(root: Path, checkpoint: Path) -> str:
+    """Return a receipt-bound identity, with exact full-name legacy fallback."""
+
+    receipt = checkpoint / ARTIFACT_ID_RECEIPT_NAME
+    if receipt.exists() or receipt.is_symlink():
+        return resolve_artifact_dir(
+            root,
+            checkpoint,
+            kind="checkpoint",
+            allow_legacy=False,
+        ).identity
+    if re.fullmatch(r"[0-9a-f]{64}", checkpoint.name):
+        return resolve_artifact_dir(
+            root,
+            checkpoint,
+            expected_identity=checkpoint.name,
+            kind="checkpoint",
+        ).identity
+    raise ArtifactIdError("legacy checkpoint identity is unavailable")
+
+
 def _review_overlay_receipt(checkpoint: Path, path: Path) -> dict[str, Any]:
     overlay = _optional_object(path)
     lane = str(overlay.get("lane") or "")
     ledger_path = path.with_name(f"{lane}-ledger.json")
     ledger = _optional_object(ledger_path)
     base = {
-        "checkpoint": checkpoint.name,
+        "checkpoint": _checkpoint_full_identity(
+            checkpoint.parent, checkpoint,
+        ),
         "chapter_id": str(overlay.get("chapter_id") or path.parent.name),
         "lane": "review",
         "reviewed_lane": "commentary" if lane == "companion" else lane,
@@ -451,7 +494,9 @@ def _review_overlay_receipt(checkpoint: Path, path: Path) -> dict[str, Any]:
 def _reader_final_receipt(project_dir: Path, checkpoint: Path, path: Path) -> dict[str, Any]:
     value = _optional_object(path)
     base = {
-        "checkpoint": checkpoint.name,
+        "checkpoint": _checkpoint_full_identity(
+            checkpoint.parent, checkpoint,
+        ),
         "lane": "reader-content",
         "source_path": str(path),
     }

@@ -340,12 +340,18 @@ def test_completed_credit_only_refresh_reuses_reviewed_content_without_provider_
             "output_pdf_sha256": legacy["pdf_sha256"],
             "source_manifest_sha256": legacy["manifest_sha256"],
             "validation_sha256": legacy["validation_sha256"],
-            "render_version": pipeline_module.FINAL_RENDER_VERSION,
-            "render_recipe_sha256": (
-                pipeline_module.pdf_render_recipe_sha256()
-            ),
-            "validator_version": "custom-validator",
-            "source_credit_sha256": legacy[
+                "render_version": pipeline_module.FINAL_RENDER_VERSION,
+                "render_recipe_sha256": (
+                    pipeline_module.pdf_render_recipe_sha256()
+                ),
+                "validator_version": "custom-validator",
+                "render_identity": "5" * 64,
+                "render_stem": "fixture",
+                "render_identity_receipt_path": str(
+                    project / "directory-identity.json"
+                ),
+                "render_identity_receipt_sha256": "6" * 64,
+                "source_credit_sha256": legacy[
                 "source_credit_sha256"
             ],
             "source_credit_observation_sha256": legacy[
@@ -4472,6 +4478,9 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     assert all("evidence" in json.loads(path.read_text(encoding="utf-8")) for path in saved_evidence)
 
     call_count = len(fake.calls)
+    reusable_state = read_json(tmp_path / "run" / "state.json")
+    _seal_strict_test_preview_receipt(reusable_state)
+    write_json(tmp_path / "run" / "state.json", reusable_state)
     # Missing user-facing outputs are repaired without model work.
     Path(data["output_html"]).unlink()
     run_pdf.unlink()
@@ -6597,15 +6606,24 @@ def test_legacy_worker_fingerprint_checkpoint_is_exactly_migrated(tmp_path: Path
         previous_state=previous_state,
     )
 
-    assert target == project / ".arc-companion" / "checkpoints" / fingerprint
-    assert not legacy.exists()
+    assert target == legacy
+    assert legacy.exists()
     assert (target / "reusable.json").is_file()
-    migration = json.loads((target / "checkpoint-migration.v1.json").read_text())
+    alias_path = (
+        project / ".arc-companion" / "checkpoints" / "aliases"
+        / f"{fingerprint}.json"
+    )
+    migration = json.loads(alias_path.read_text())
     assert migration["legacy_fingerprint"] == legacy_fingerprint
     assert migration["content_fingerprint"] == fingerprint
     assert migration["legacy_workers_per_lane"] == 24
+    assert migration["legacy_checkpoint_dir"] == str(legacy.resolve())
     assert previous_state["fingerprint"] == fingerprint
     assert previous_state["checkpoint_dir"] == str(target)
+    assert previous_state["checkpoint_alias_identity"] == fingerprint
+    assert previous_state["checkpoint_alias_receipt_path"] == str(
+        alias_path
+    )
 
 
 def test_legacy_worker_checkpoint_is_found_without_context_json(tmp_path: Path) -> None:
@@ -6619,14 +6637,22 @@ def test_legacy_worker_checkpoint_is_found_without_context_json(tmp_path: Path) 
         options,
         evidence=evidence,
         domain_context=None,
-        workers_per_lane=317,
+        workers_per_lane=1317,
     )
     legacy = project / ".arc-companion" / "checkpoints" / legacy_fingerprint
     legacy.mkdir(parents=True)
+    unrelated = (
+        project / ".arc-companion" / "checkpoints" / "deadbeefdead"
+    )
+    unrelated.mkdir()
+    (unrelated / "directory-identity.json").write_text(
+        "{corrupt", encoding="utf-8",
+    )
     (legacy / "window-0152.json").write_text("{}", encoding="utf-8")
     previous_state = {
         "fingerprint": legacy_fingerprint,
         "checkpoint_dir": str(legacy.resolve()),
+        "recovery_options": {"workers": 1317},
     }
 
     target = _checkpoint_dir_with_legacy_worker_migration(
@@ -6639,32 +6665,279 @@ def test_legacy_worker_checkpoint_is_found_without_context_json(tmp_path: Path) 
         previous_state=previous_state,
     )
 
-    assert target.name == fingerprint
-    assert not legacy.exists()
+    assert target == legacy
+    assert legacy.exists()
     assert (target / "window-0152.json").is_file()
-    migration = json.loads((target / "checkpoint-migration.v1.json").read_text())
-    assert migration["legacy_workers_per_lane"] == 317
+    alias_path = (
+        project / ".arc-companion" / "checkpoints" / "aliases"
+        / f"{fingerprint}.json"
+    )
+    migration = json.loads(alias_path.read_text())
+    assert migration["legacy_workers_per_lane"] == 1317
+
+
+def test_checkpoint_state_replaces_receipt_and_alias_groups_atomically(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "state-authority"
+    state_path = project / "state.json"
+    checkpoint_root = project / ".arc-companion" / "checkpoints"
+    bootstrap_identity = "1" * 64
+    bootstrap = pipeline_module.allocate_artifact_dir(
+        checkpoint_root, bootstrap_identity, kind="checkpoint",
+    )
+    pipeline_module._state(
+        state_path,
+        fingerprint=bootstrap_identity,
+        checkpoint_dir=str(bootstrap.path),
+        **pipeline_module._checkpoint_identity_state(
+            project, bootstrap.path, bootstrap_identity,
+        ),
+    )
+    intent_state = pipeline_module._state(
+        state_path,
+        status="building_intent_guidance",
+        checkpoint_dir=str(
+            project / ".arc-companion" / "intent-guidance"
+            / bootstrap_identity
+        ),
+        checkpoint_identity=None,
+        recovery_root_kind="intent-guidance",
+        recovery_root_fingerprint=bootstrap_identity,
+    )
+    assert "checkpoint_identity" not in intent_state
+    assert intent_state["recovery_root_fingerprint"] == bootstrap_identity
+    logical = "2" * 64
+    physical = "3" * 64
+    legacy = checkpoint_root / physical
+    legacy.mkdir()
+    alias = pipeline_module.ensure_artifact_alias_receipt(
+        checkpoint_root,
+        logical,
+        {
+            "schema_version": "arc.companion.checkpoint-alias.v1",
+            "kind": "workers-to-total-concurrency-budget",
+            "alias_identity": logical,
+            "legacy_fingerprint": physical,
+            "content_fingerprint": logical,
+            "legacy_checkpoint_dir": str(legacy),
+            "legacy_workers_per_lane": 2049,
+        },
+    )
+    aliased_state = pipeline_module._state(
+        state_path,
+        fingerprint=logical,
+        checkpoint_dir=str(legacy),
+        checkpoint_identity=logical,
+        checkpoint_alias_identity=logical,
+        checkpoint_alias_receipt_path=str(alias.path),
+        checkpoint_alias_receipt_sha256=alias.sha256,
+    )
+    assert "checkpoint_identity_receipt_path" not in aliased_state
+    assert aliased_state["checkpoint_alias_identity"] == logical
+    assert "recovery_root_kind" not in aliased_state
+    assert "recovery_root_fingerprint" not in aliased_state
+    final_identity = "4" * 64
+    final = pipeline_module.allocate_artifact_dir(
+        checkpoint_root, final_identity, kind="checkpoint",
+    )
+    final_state = pipeline_module._state(
+        state_path,
+        fingerprint=final_identity,
+        checkpoint_dir=str(final.path),
+        **pipeline_module._checkpoint_identity_state(
+            project, final.path, final_identity,
+        ),
+    )
+    assert final_state["checkpoint_identity"] == final_identity
+    assert "checkpoint_alias_identity" not in final_state
+    assert final_state["checkpoint_identity_receipt_path"] == str(
+        final.receipt_path
+    )
+
+
+def _seal_strict_test_preview_receipt(state: dict[str, object]) -> None:
+    tex = Path(str(state["preview_tex"]))
+    pdf = Path(str(state["preview_pdf"]))
+    manifest = Path(str(state["preview_source_manifest_path"]))
+    validation = Path(str(state["preview_validation_path"]))
+    validator = str(state["preview_validator_version"])
+    write_json(validation, build_pdf_validation_receipt(
+        content_sha256=str(state["preview_content_sha256"]),
+        pdf_sha256=sha256_file(pdf),
+        tex_sha256=sha256_file(tex),
+        source_manifest_sha256=sha256_file(manifest),
+        pdf_report={
+            "validator": validator,
+            "result": "success",
+            "pages": 1,
+            "pages_checked": 1,
+            "dpi": 144,
+            "pdf_bytes": pdf.stat().st_size,
+            "text_bytes": 1,
+            "raster_bytes": 1,
+            "encrypted": False,
+            "embedded_font_count": 2,
+            "font_roles": {
+                "sans": ["Noto Sans"],
+                "serif": ["Latin Modern"],
+            },
+        },
+        source_credit_pdf={
+            "schema_version": (
+                "arc.companion.source-credit-pdf-observation.v1"
+            ),
+            "canonical_sha256": "a" * 64,
+            "searchable_text_sha256": "b" * 64,
+            "ordered_ids": [],
+            "visible_projection_sha256": "c" * 64,
+            "visible_counts": {
+                "authors": 0,
+                "affiliations": 0,
+                "profiles": 0,
+            },
+        },
+        preview=True,
+        validator_version=validator,
+        reusable=False,
+    ))
+    state["preview_validation_sha256"] = sha256_file(validation)
 
 
 def test_preview_completion_check_is_independent_of_current_worker_budget(tmp_path: Path) -> None:
+    content_sha256 = "7" * 64
+    recipe = pipeline_module.pdf_render_recipe_sha256()
+    validator = PDF_VALIDATOR_VERSION
+    stem = "preview"
+    nonce = "8" * 32
+    payload = {
+        "content_sha256": content_sha256,
+        "render_recipe_sha256": recipe,
+        "validator_version": validator,
+        "stem": stem,
+    }
+    identity = pipeline_module.render_artifact_identity(
+        kind="pdf-render", payload=payload, nonce=nonce,
+    )
+    allocation = pipeline_module.allocate_artifact_dir(
+        tmp_path / ".arc-companion" / "renders" / "pdf",
+        identity,
+        kind="pdf-render",
+        stem=stem,
+        payload=payload,
+        nonce=nonce,
+        allow_legacy=False,
+    )
     state: dict[str, object] = {
         "first_wave_preview_version": pipeline_module.FIRST_WAVE_PREVIEW_VERSION,
         "segment_count": 20,
         "preview_segment_count": 12,
         "preview_segment_ids": [f"seg-{index:04d}" for index in range(1, 13)],
+        "preview_content_sha256": content_sha256,
+        "preview_render_identity": identity,
+        "preview_render_stem": stem,
+        "preview_render_identity_receipt_path": str(
+            allocation.receipt_path
+        ),
+        "preview_render_identity_receipt_sha256": (
+            allocation.receipt_sha256
+        ),
+        "preview_render_recipe_sha256": recipe,
+        "preview_validator_version": validator,
     }
     for path_key, hash_key in (
         ("preview_tex", "preview_tex_sha256"),
         ("preview_pdf", "preview_pdf_sha256"),
         ("preview_source_manifest_path", "preview_source_manifest_sha256"),
-        ("preview_validation_path", "preview_validation_sha256"),
     ):
-        path = tmp_path / path_key
+        path = allocation.path / path_key
         path.write_bytes(path_key.encode("utf-8"))
         state[path_key] = str(path)
         state[hash_key] = hashlib.sha256(path.read_bytes()).hexdigest()
+    validation_path = allocation.path / "preview_validation_path"
+    validation_path.write_text(json.dumps(build_pdf_validation_receipt(
+        content_sha256=content_sha256,
+        pdf_sha256=str(state["preview_pdf_sha256"]),
+        tex_sha256=str(state["preview_tex_sha256"]),
+        source_manifest_sha256=str(
+            state["preview_source_manifest_sha256"]
+        ),
+        pdf_report={
+            "validator": PDF_VALIDATOR_VERSION,
+            "result": "success",
+            "pages": 1,
+            "pages_checked": 1,
+            "dpi": 144,
+            "pdf_bytes": Path(str(state["preview_pdf"])).stat().st_size,
+            "text_bytes": 3,
+            "raster_bytes": 9,
+            "encrypted": False,
+            "embedded_font_count": 2,
+            "font_roles": {
+                "sans": ["Noto Sans"],
+                "serif": ["Latin Modern"],
+            },
+        },
+        source_credit_pdf={
+            "schema_version": (
+                "arc.companion.source-credit-pdf-observation.v1"
+            ),
+            "canonical_sha256": "a" * 64,
+            "searchable_text_sha256": "b" * 64,
+            "ordered_ids": ["author:1"],
+            "visible_projection_sha256": "c" * 64,
+            "visible_counts": {
+                "authors": 1,
+                "affiliations": 0,
+                "profiles": 0,
+            },
+        },
+        preview=True,
+        validator_version=validator,
+        reusable=False,
+    )), encoding="utf-8")
+    state["preview_validation_path"] = str(validation_path)
+    state["preview_validation_sha256"] = hashlib.sha256(
+        validation_path.read_bytes()
+    ).hexdigest()
 
-    assert _first_wave_preview_outputs_match(state)
+    assert _first_wave_preview_outputs_match(state, tmp_path)
+    saved_receipt = tmp_path / "preview-identity-receipt-link"
+    saved_receipt.symlink_to(allocation.receipt_path)
+    assert not _first_wave_preview_outputs_match({
+        **state,
+        "preview_render_identity_receipt_path": str(saved_receipt),
+    }, tmp_path)
+    tampered = {
+        **state,
+        "preview_render_recipe_sha256": "9" * 64,
+    }
+    assert not _first_wave_preview_outputs_match(tampered, tmp_path)
+    receipt = json.loads(validation_path.read_text(encoding="utf-8"))
+    mutations = (
+        lambda value: value.update({"reusable": True}),
+        lambda value: value.update({"fidelity_errors": ["bad"]}),
+        lambda value: value.update({"pdf": {}}),
+        lambda value: value["pdf"].update({"pdf_bytes": 999}),
+        lambda value: value.update({"source_credit_pdf": {}}),
+        lambda value: value.update({"warnings": ["x"] * 129}),
+        lambda value: value.update({"unexpected": True}),
+    )
+    for mutate in mutations:
+        mutated_receipt = json.loads(json.dumps(receipt))
+        mutate(mutated_receipt)
+        validation_path.write_text(
+            json.dumps(mutated_receipt), encoding="utf-8",
+        )
+        self_consistent = {
+            **state,
+            "preview_validation_sha256": hashlib.sha256(
+                validation_path.read_bytes()
+            ).hexdigest(),
+        }
+        assert not _first_wave_preview_outputs_match(
+            self_consistent, tmp_path,
+        )
 
 
 def test_completed_fast_path_requires_current_projection_guide_and_reader_versions(
@@ -9425,6 +9698,7 @@ def test_exact_pdf_resume_is_a_state_file_noop(tmp_path: Path) -> None:
     assert first["ok"], first
     state_path = project / "state.json"
     state = read_json(state_path)
+    _seal_strict_test_preview_receipt(state)
     pdf_state = state["published"]["pdf"]
     pdf = Path(pdf_state["output_pdf"])
     tex = Path(pdf_state["output_tex"])
@@ -9479,6 +9753,49 @@ def test_exact_pdf_resume_is_a_state_file_noop(tmp_path: Path) -> None:
         "validator_version": PDF_VALIDATOR_VERSION,
         "validation_sha256": sha256_file(receipt_path),
     }
+    old_render_dir = pdf.parent
+    old_identity_receipt = (
+        old_render_dir / "directory-identity.json"
+    )
+    old_identity = read_json(old_identity_receipt)
+    render_stem = str(old_identity["stem"])
+    nonce = "a" * 32
+    payload = {
+        "content_sha256": state["published"]["content_sha256"],
+        "render_recipe_sha256": pdf_render_recipe_sha256(),
+        "validator_version": PDF_VALIDATOR_VERSION,
+        "stem": render_stem,
+    }
+    render_identity = pipeline_module.render_artifact_identity(
+        kind="pdf-render", payload=payload, nonce=nonce,
+    )
+    allocation = pipeline_module.allocate_artifact_dir(
+        project / ".arc-companion" / "renders" / "pdf",
+        render_identity,
+        kind="pdf-render",
+        stem=render_stem,
+        payload=payload,
+        nonce=nonce,
+        allow_legacy=False,
+    )
+    for path_key in (
+        "output_tex",
+        "output_pdf",
+        "source_manifest_path",
+        "validation_path",
+    ):
+        source = Path(pdf_state[path_key])
+        target = allocation.path / source.name
+        source.replace(target)
+        pdf_state[path_key] = str(target)
+        state[path_key] = str(target)
+    old_identity_receipt.unlink()
+    current_fields.update({
+        "render_identity": render_identity,
+        "render_stem": render_stem,
+        "render_identity_receipt_path": str(allocation.receipt_path),
+        "render_identity_receipt_sha256": allocation.receipt_sha256,
+    })
     pdf_state.update(current_fields)
     state.update(current_fields)
     write_json(state_path, state)
@@ -9524,6 +9841,7 @@ def test_interrupted_final_state_adopts_published_revision_without_recompile(
     assert first["ok"], first
     state_path = project / "state.json"
     state = read_json(state_path)
+    _seal_strict_test_preview_receipt(state)
     pdf_state = state["published"]["pdf"]
     pdf = Path(pdf_state["output_pdf"])
     tex = Path(pdf_state["output_tex"])
@@ -9572,6 +9890,43 @@ def test_interrupted_final_state_adopts_published_revision_without_recompile(
             },
         ),
     )
+    old_render_dir = pdf.parent
+    old_identity_receipt = (
+        old_render_dir / "directory-identity.json"
+    )
+    old_identity = read_json(old_identity_receipt)
+    render_stem = str(old_identity["stem"])
+    nonce = "b" * 32
+    payload = {
+        "content_sha256": state["published"]["content_sha256"],
+        "render_recipe_sha256": pdf_render_recipe_sha256(),
+        "validator_version": PDF_VALIDATOR_VERSION,
+        "stem": render_stem,
+    }
+    render_identity = pipeline_module.render_artifact_identity(
+        kind="pdf-render", payload=payload, nonce=nonce,
+    )
+    allocation = pipeline_module.allocate_artifact_dir(
+        project / ".arc-companion" / "renders" / "pdf",
+        render_identity,
+        kind="pdf-render",
+        stem=render_stem,
+        payload=payload,
+        nonce=nonce,
+        allow_legacy=False,
+    )
+    for path_key in (
+        "output_tex",
+        "output_pdf",
+        "source_manifest_path",
+        "validation_path",
+    ):
+        source = Path(pdf_state[path_key])
+        target = allocation.path / source.name
+        source.replace(target)
+        if path_key == "output_pdf":
+            pdf = target
+    old_identity_receipt.unlink()
     state["status"] = interrupted_status
     state["published"].pop("pdf")
     for key in (
@@ -9628,6 +9983,8 @@ def test_complete_resume_requires_matching_output_hashes(tmp_path: Path) -> None
     )
     assert first["ok"]
     state = json.loads((project / "state.json").read_text())
+    _seal_strict_test_preview_receipt(state)
+    write_json(project / "state.json", state)
     assert state["output_pdf_sha256"] and state["output_tex_sha256"]
     Path(state["output_pdf"]).write_bytes(b"%PDF tampered")
 
@@ -9699,6 +10056,8 @@ def test_final_pdf_partial_replace_failure_preserves_published_revision(
     first = build_companion(options, llm=FakeLLM(), **build_kwargs)
     assert first["ok"] is True
     old_state = json.loads((project / "state.json").read_text())
+    _seal_strict_test_preview_receipt(old_state)
+    write_json(project / "state.json", old_state)
     old_pdf = Path(old_state["published"]["pdf"]["output_pdf"])
     old_bytes = old_pdf.read_bytes()
 

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 
 import pytest
 
+from arc_companion.artifact_ids import (
+    allocate_artifact_dir,
+    render_artifact_identity,
+)
 from arc_companion.io import sha256_file, write_json
 from arc_companion.pdf import (
     PDF_RENDER_VERSION,
@@ -13,6 +18,7 @@ from arc_companion.pdf import (
     build_pdf_validation_receipt,
     find_adoptable_pdf_revision,
     match_validated_pdf_revision,
+    pdf_validation_receipt_is_closed,
     pdf_render_recipe_sha256,
 )
 
@@ -45,9 +51,45 @@ PDF_REPORT = {
 }
 
 
-def _revision(project: Path) -> dict[str, object]:
-    root = project / ".arc-companion" / "renders" / "pdf" / "revision"
-    root.mkdir(parents=True)
+def _revision(
+    project: Path, *, legacy_directory: bool = False,
+) -> dict[str, object]:
+    renders = project / ".arc-companion" / "renders" / "pdf"
+    render_state: dict[str, object] = {}
+    if legacy_directory:
+        root = renders / "revision"
+        root.mkdir(parents=True)
+    else:
+        payload = {
+            "content_sha256": CONTENT_SHA256,
+            "render_recipe_sha256": pdf_render_recipe_sha256(),
+            "validator_version": PDF_VALIDATOR_VERSION,
+            "stem": CONTENT_SHA256,
+        }
+        nonce = "1" * 32
+        identity = render_artifact_identity(
+            kind="pdf-render", payload=payload, nonce=nonce,
+        )
+        allocation = allocate_artifact_dir(
+            renders,
+            identity,
+            kind="pdf-render",
+            stem=CONTENT_SHA256,
+            payload=payload,
+            nonce=nonce,
+            allow_legacy=False,
+        )
+        root = allocation.path
+        render_state = {
+            "render_identity": identity,
+            "render_stem": CONTENT_SHA256,
+            "render_identity_receipt_path": str(
+                allocation.receipt_path
+            ),
+            "render_identity_receipt_sha256": (
+                allocation.receipt_sha256
+            ),
+        }
     tex = root / "paper.tex"
     pdf = root / "paper.pdf"
     manifest = root / "source-manifest.json"
@@ -66,6 +108,7 @@ def _revision(project: Path) -> dict[str, object]:
     write_json(receipt, receipt_value)
     pdf_state = {
         "content_sha256": CONTENT_SHA256,
+        **render_state,
         "render_version": PDF_RENDER_VERSION,
         "render_recipe_sha256": pdf_render_recipe_sha256(),
         "validator_version": PDF_VALIDATOR_VERSION,
@@ -122,6 +165,38 @@ def test_fully_published_revision_is_adoptable_before_state_commit(
     assert decision.revision["output_pdf_sha256"]
 
 
+def test_legacy_directory_is_matchable_only_from_exact_state(
+    tmp_path: Path,
+) -> None:
+    state = _revision(tmp_path, legacy_directory=True)
+    assert match_validated_pdf_revision(
+        tmp_path, state, content_sha256=CONTENT_SHA256,
+    ).reusable
+    decision = find_adoptable_pdf_revision(
+        tmp_path, content_sha256=CONTENT_SHA256,
+    )
+    assert not decision.reusable
+    assert decision.reason == "adoptable_revision_missing"
+
+
+def test_render_identity_receipt_must_share_revision_parent(
+    tmp_path: Path,
+) -> None:
+    state = _revision(tmp_path)
+    pdf_state = state["published"]["pdf"]
+    copied = tmp_path / "copied-directory-identity.json"
+    copied.write_bytes(
+        Path(pdf_state["render_identity_receipt_path"]).read_bytes()
+    )
+    pdf_state["render_identity_receipt_path"] = str(copied)
+    pdf_state["render_identity_receipt_sha256"] = sha256_file(copied)
+    decision = match_validated_pdf_revision(
+        tmp_path, state, content_sha256=CONTENT_SHA256,
+    )
+    assert not decision.reusable
+    assert decision.reason == "render_identity_receipt_path_unsafe"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     [
@@ -130,6 +205,7 @@ def test_fully_published_revision_is_adoptable_before_state_commit(
         ("validator_version", "old", "validator_mismatch"),
         ("output_pdf_sha256", "4" * 64, "pdf_sha256_mismatch"),
         ("validation_sha256", "5" * 64, "receipt_hash_mismatch"),
+        ("render_stem", "other", "render_identity_payload_mismatch"),
     ],
 )
 def test_match_validated_pdf_revision_rejects_identity_mismatch(
@@ -153,6 +229,75 @@ def test_match_validated_pdf_revision_rejects_identity_mismatch(
 
     assert not decision.reusable
     assert decision.reason == reason
+
+
+def test_current_revision_cannot_drop_all_render_identity_fields(
+    tmp_path: Path,
+) -> None:
+    state = _revision(tmp_path)
+    pdf_state = state["published"]["pdf"]
+    for key in (
+        "render_identity",
+        "render_stem",
+        "render_identity_receipt_path",
+        "render_identity_receipt_sha256",
+    ):
+        pdf_state.pop(key)
+    decision = match_validated_pdf_revision(
+        tmp_path, state, content_sha256=CONTENT_SHA256,
+    )
+    assert not decision.reusable
+    assert decision.reason == "render_identity_incomplete"
+
+
+def test_present_but_empty_render_identity_fields_are_not_legacy(
+    tmp_path: Path,
+) -> None:
+    state = _revision(tmp_path)
+    pdf_state = state["published"]["pdf"]
+    for key in (
+        "render_identity",
+        "render_stem",
+        "render_identity_receipt_path",
+        "render_identity_receipt_sha256",
+    ):
+        pdf_state[key] = ""
+    decision = match_validated_pdf_revision(
+        tmp_path, state, content_sha256=CONTENT_SHA256,
+    )
+    assert not decision.reusable
+    assert decision.reason == "render_identity_invalid"
+
+
+def test_source_credit_ordered_ids_must_fill_the_bounded_projection(
+    tmp_path: Path,
+) -> None:
+    state = _revision(tmp_path)
+    receipt = json.loads(Path(
+        state["published"]["pdf"]["validation_path"]
+    ).read_text(encoding="utf-8"))
+    credit = receipt["source_credit_pdf"]
+    credit["visible_counts"] = {
+        "authors": 129,
+        "affiliations": 0,
+        "profiles": 0,
+    }
+    credit["ordered_ids"] = [
+        f"author:{index}" for index in range(128)
+    ]
+    assert pdf_validation_receipt_is_closed(
+        receipt,
+        scope="final",
+        reusable=True,
+        validator_version=PDF_VALIDATOR_VERSION,
+    )
+    credit["ordered_ids"] = []
+    assert not pdf_validation_receipt_is_closed(
+        receipt,
+        scope="final",
+        reusable=True,
+        validator_version=PDF_VALIDATOR_VERSION,
+    )
 
 
 def test_match_validated_pdf_revision_rejects_legacy_receipt(

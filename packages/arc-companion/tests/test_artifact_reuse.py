@@ -11,6 +11,7 @@ from arc_companion.artifact_store import (
     ArtifactStoreError,
     canonical_sha256,
 )
+from arc_companion.artifact_ids import allocate_artifact_dir
 from arc_companion.migration import (
     accepted_translation_projection_candidates,
     import_accepted_checkpoint_objects,
@@ -461,7 +462,12 @@ def test_scoped_regeneration_requires_confirmation_for_all_and_rejects_force() -
 
 def test_all_fingerprint_migration_imports_only_strong_accepted_receipts(tmp_path: Path) -> None:
     project = tmp_path / "project"
-    checkpoint = project / ".arc-companion" / "checkpoints" / "fingerprint-a"
+    checkpoint_identity = "a" * 64
+    checkpoint = allocate_artifact_dir(
+        project / ".arc-companion" / "checkpoints",
+        checkpoint_identity,
+        kind="checkpoint",
+    ).path
     annotation_dir = checkpoint / "annotations"
     chapter_dir = checkpoint / "chapters" / "ch-0001"
     annotation_dir.mkdir(parents=True)
@@ -490,6 +496,7 @@ def test_all_fingerprint_migration_imports_only_strong_accepted_receipts(tmp_pat
     assert report["provider_calls"] == 0
     assert len(report["imported_artifact_ids"]) == 1
     assert report["receipts"][0]["accepted"] is True
+    assert report["receipts"][0]["checkpoint"] == checkpoint_identity
 
     ledger["blocks"][0]["accepted_chain_sha256"] = "0" * 64
     (chapter_dir / "companion-ledger.json").write_text(json.dumps(ledger), encoding="utf-8")
@@ -502,7 +509,9 @@ def test_all_fingerprint_migration_imports_only_strong_accepted_receipts(tmp_pat
 
 def test_migration_validates_review_binding_and_imports_valid_reader_final(tmp_path: Path) -> None:
     project = tmp_path / "project"
-    checkpoint = project / ".arc-companion" / "checkpoints" / "fingerprint-a"
+    checkpoint = (
+        project / ".arc-companion" / "checkpoints" / ("a" * 64)
+    )
     chapter_dir = checkpoint / "chapters" / "ch-0001"
     chapter_dir.mkdir(parents=True)
     output = {"commentary": "base", "commentary_sources": []}

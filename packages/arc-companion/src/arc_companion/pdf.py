@@ -13,6 +13,11 @@ import tempfile
 from typing import Any, Callable, Mapping
 import uuid
 
+from .artifact_ids import (
+    ARTIFACT_ID_RECEIPT_NAME,
+    ArtifactIdError,
+    resolve_artifact_dir,
+)
 from .io import sha256_file
 
 
@@ -511,15 +516,25 @@ def _hash_regular_file_nofollow(
     return digest.hexdigest(), details.st_size
 
 
-def _current_receipt_is_closed(receipt: Mapping[str, object]) -> bool:
+def pdf_validation_receipt_is_closed(
+    receipt: Mapping[str, object],
+    *,
+    scope: str,
+    reusable: bool,
+    validator_version: str,
+) -> bool:
+    """Validate the exact receipt and nested evidence contract for one scope."""
+
+    if scope not in {"preview", "final"}:
+        return False
     if set(receipt) != _PDF_RECEIPT_KEYS:
         return False
     if (
         receipt.get("schema_version")
         != PDF_VALIDATION_RECEIPT_VERSION
         or receipt.get("result") != "success"
-        or receipt.get("scope") != "final"
-        or receipt.get("reusable") is not True
+        or receipt.get("scope") != scope
+        or receipt.get("reusable") is not reusable
         or receipt.get("render_version") != PDF_RENDER_VERSION
     ):
         return False
@@ -534,7 +549,7 @@ def _current_receipt_is_closed(receipt: Mapping[str, object]) -> bool:
         )
     ):
         return False
-    if receipt.get("validator_version") != PDF_VALIDATOR_VERSION:
+    if receipt.get("validator_version") != validator_version:
         return False
     fidelity = receipt.get("fidelity_errors")
     warnings = receipt.get("warnings")
@@ -553,7 +568,7 @@ def _current_receipt_is_closed(receipt: Mapping[str, object]) -> bool:
     if not isinstance(summary, Mapping) or set(summary) != _PDF_SUMMARY_KEYS:
         return False
     if (
-        summary.get("validator") != PDF_VALIDATOR_VERSION
+        summary.get("validator") != validator_version
         or summary.get("result") != "success"
         or summary.get("dpi") != PDF_RASTER_DPI
         or summary.get("encrypted") is not False
@@ -628,15 +643,21 @@ def _current_receipt_is_closed(receipt: Mapping[str, object]) -> bool:
         return False
     visible_total = sum(int(counts[key]) for key in counts)
     if (
-        visible_total < len(ordered_ids)
-        or (
-            visible_total <= PDF_FONT_ROLE_MAX_ITEMS
-            and visible_total != len(ordered_ids)
-        )
+        len(ordered_ids)
+        != min(visible_total, PDF_FONT_ROLE_MAX_ITEMS)
         or len(set(ordered_ids)) != len(ordered_ids)
     ):
         return False
     return True
+
+
+def _current_receipt_is_closed(receipt: Mapping[str, object]) -> bool:
+    return pdf_validation_receipt_is_closed(
+        receipt,
+        scope="final",
+        reusable=True,
+        validator_version=PDF_VALIDATOR_VERSION,
+    )
 
 
 def current_pdf_validation_receipt_matches(
@@ -717,6 +738,73 @@ def match_validated_pdf_revision(
         if path is None:
             return PDFReuseDecision(False, f"{path_key}_unsafe")
         files[path_key] = path
+    revision_parent = files["output_pdf"].parent
+    render_identity_fields = (
+        "render_identity",
+        "render_stem",
+        "render_identity_receipt_path",
+        "render_identity_receipt_sha256",
+    )
+    present_render_fields = [
+        key for key in render_identity_fields if key in effective
+    ]
+    identity_receipt_at_revision = (
+        revision_parent / ARTIFACT_ID_RECEIPT_NAME
+    )
+    resolved_render = None
+    if not present_render_fields:
+        try:
+            identity_receipt_at_revision.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            return PDFReuseDecision(
+                False, "render_identity_incomplete",
+            )
+    if present_render_fields:
+        if any(path.parent != revision_parent for path in files.values()):
+            return PDFReuseDecision(
+                False, "render_revision_parent_mismatch",
+            )
+        if len(present_render_fields) != len(render_identity_fields):
+            return PDFReuseDecision(False, "render_identity_incomplete")
+        if not _is_sha256(effective.get("render_identity")):
+            return PDFReuseDecision(False, "render_identity_invalid")
+        if not _is_sha256(effective.get("render_identity_receipt_sha256")):
+            return PDFReuseDecision(
+                False, "render_identity_receipt_sha256_missing",
+            )
+        identity_receipt = _project_regular_file(
+            Path(project_dir),
+            effective.get("render_identity_receipt_path"),
+        )
+        if (
+            identity_receipt is None
+            or identity_receipt.name != ARTIFACT_ID_RECEIPT_NAME
+            or identity_receipt.parent != revision_parent
+        ):
+            return PDFReuseDecision(
+                False, "render_identity_receipt_path_unsafe",
+            )
+        try:
+            resolved = resolve_artifact_dir(
+                Path(project_dir) / ".arc-companion" / "renders" / "pdf",
+                revision_parent,
+                expected_identity=str(effective["render_identity"]),
+                kind="pdf-render",
+                allow_legacy=False,
+            )
+        except (ArtifactIdError, OSError, ValueError):
+            return PDFReuseDecision(False, "render_identity_mismatch")
+        if (
+            resolved.receipt_path != identity_receipt
+            or resolved.receipt_sha256
+            != effective["render_identity_receipt_sha256"]
+        ):
+            return PDFReuseDecision(
+                False, "render_identity_receipt_hash_mismatch",
+            )
+        resolved_render = resolved
     receipt_path = files["validation_path"]
     try:
         receipt_bytes = _read_bounded_regular_file(receipt_path)
@@ -760,6 +848,18 @@ def match_validated_pdf_revision(
         return PDFReuseDecision(False, "render_recipe_mismatch")
     if effective.get("validator_version") != validator_version:
         return PDFReuseDecision(False, "validator_mismatch")
+    if resolved_render is not None and (
+        resolved_render.payload != {
+            "content_sha256": content_sha256,
+            "render_recipe_sha256": recipe,
+            "validator_version": validator_version,
+            "stem": effective.get("render_stem"),
+        }
+        or resolved_render.nonce is None
+    ):
+        return PDFReuseDecision(
+            False, "render_identity_payload_mismatch",
+        )
     source_credit = dict(receipt["source_credit_pdf"])
     if (
         effective.get("source_credit_sha256")
@@ -822,6 +922,10 @@ def match_validated_pdf_revision(
             key: effective[key]
             for key in (
                 "content_sha256",
+                "render_identity",
+                "render_stem",
+                "render_identity_receipt_path",
+                "render_identity_receipt_sha256",
                 "render_recipe_sha256",
                 "validator_version",
                 "output_tex",
@@ -862,6 +966,15 @@ def find_adoptable_pdf_revision(
     except OSError:
         return PDFReuseDecision(False, "adoptable_revision_unreadable")
     for directory in directories:
+        try:
+            allocation = resolve_artifact_dir(
+                renders,
+                directory,
+                kind="pdf-render",
+                allow_legacy=False,
+            )
+        except (ArtifactIdError, OSError, ValueError):
+            continue
         manifest = directory / "source-manifest.json"
         receipt_path = directory / "validation.json"
         tex_files = [
@@ -901,6 +1014,17 @@ def find_adoptable_pdf_revision(
             continue
         pdf_state = {
             "content_sha256": content_sha256,
+            "render_identity": allocation.identity,
+            "render_stem": (
+                allocation.payload.get("stem")
+                if allocation.payload is not None else None
+            ),
+            "render_identity_receipt_path": str(
+                allocation.receipt_path
+            ),
+            "render_identity_receipt_sha256": (
+                allocation.receipt_sha256
+            ),
             "render_version": PDF_RENDER_VERSION,
             "render_recipe_sha256": pdf_render_recipe_sha256(),
             "validator_version": PDF_VALIDATOR_VERSION,

@@ -37,6 +37,14 @@ from .content import (
 )
 from .chapters import CHAPTERS_VERSION, build_chapters
 from .artifact_store import AcceptedArtifactStore, artifact_id_for, canonical_sha256
+from .artifact_ids import (
+    ARTIFACT_ID_RECEIPT_NAME,
+    allocate_artifact_dir,
+    ensure_artifact_alias_receipt,
+    read_artifact_alias_receipt,
+    render_artifact_identity,
+    resolve_artifact_dir,
+)
 from .chapter_glossary import (
     INDEX_GLOSSARY_BATCH_VERSION,
     generate_index_glossary,
@@ -151,6 +159,7 @@ from .pdf import (
     managed_run_root_pdf_path,
     match_validated_pdf_revision,
     normalize_run_root_pdf_state,
+    pdf_validation_receipt_is_closed,
     pdf_render_recipe_sha256,
     publish_run_root_pdf,
     validate_pdf,
@@ -973,10 +982,19 @@ def _build_companion_unlocked(
                 ),
             )
         fingerprint = bootstrap_fingerprint
-        checkpoint_dir = (
-            project_dir / ".arc-companion" / "checkpoints" / fingerprint
-        )
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = allocate_artifact_dir(
+            project_dir / ".arc-companion" / "checkpoints",
+            fingerprint,
+            kind="checkpoint",
+        ).path
+        if not completion_probe:
+            _state(
+                state_path,
+                checkpoint_dir=str(checkpoint_dir),
+                **_checkpoint_identity_state(
+                    project_dir, checkpoint_dir, fingerprint,
+                ),
+            )
         write_json(checkpoint_dir / "document.json", bundle.parsed)
         if prebuilt_chapters_pack is not None:
             write_json(checkpoint_dir / "chapters.json", prebuilt_chapters_pack)
@@ -999,7 +1017,7 @@ def _build_companion_unlocked(
             "schema_version": "arc.companion.source-snapshot-receipt.v2",
             "paper_id": bundle.paper_id,
             "fingerprint": fingerprint,
-            "checkpoint_identity": checkpoint_dir.name,
+            "checkpoint_identity": fingerprint,
             "build_instance_id": build_instance_id,
             "build_request_sha256": build_request_sha256,
             "build_source_fingerprint": fingerprint,
@@ -1072,7 +1090,7 @@ def _build_companion_unlocked(
                 "schema_version": "arc.companion.source-snapshot-receipt.v2",
                 "paper_id": bundle.paper_id,
                 "fingerprint": bootstrap_fingerprint,
-                "checkpoint_identity": checkpoint_dir.name,
+                "checkpoint_identity": bootstrap_fingerprint,
                 "build_instance_id": build_instance_id,
                 "build_request_sha256": build_request_sha256,
                 "build_source_fingerprint": bootstrap_fingerprint,
@@ -1116,6 +1134,9 @@ def _build_companion_unlocked(
                 status="building_intent_guidance",
                 paper_id=options.paper_id,
                 checkpoint_dir=str(checkpoint_dir),
+                checkpoint_identity=None,
+                recovery_root_kind="intent-guidance",
+                recovery_root_fingerprint=bootstrap_fingerprint,
                 recovery_options=_recovery_options(options),
             )
 
@@ -1190,6 +1211,23 @@ def _build_companion_unlocked(
             domain_context=domain_context,
             previous_state=previous_state,
         )
+        if not completion_probe:
+            _state(
+                state_path,
+                checkpoint_dir=str(checkpoint_dir),
+                **_checkpoint_identity_state(
+                    project_dir, checkpoint_dir, fingerprint,
+                ),
+                **{
+                    key: previous_state[key]
+                    for key in (
+                        "checkpoint_alias_identity",
+                        "checkpoint_alias_receipt_path",
+                        "checkpoint_alias_receipt_sha256",
+                    )
+                    if previous_state.get(key)
+                },
+            )
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         source_credit = _load_or_store_source_credit(
             checkpoint_dir, source_credit,
@@ -1199,9 +1237,19 @@ def _build_companion_unlocked(
                 state_path,
                 source_credit_sha256=source_credit["canonical_sha256"],
             )
-        previous_checkpoint = Path(str(previous_state.get("checkpoint_dir") or ""))
+        previous_checkpoint: Path | None = None
+        if previous_state.get("checkpoint_dir"):
+            try:
+                previous_checkpoint = _resolve_checkpoint_state_identity(
+                    project_dir,
+                    previous_state,
+                    Path(str(previous_state["checkpoint_dir"])),
+                ).path
+            except (OSError, RuntimeError, ValueError):
+                previous_checkpoint = None
         if (
             not options.skip_translation
+            and previous_checkpoint is not None
             and previous_checkpoint.is_dir()
             and previous_checkpoint != checkpoint_dir
             and not options.force
@@ -1267,7 +1315,9 @@ def _build_companion_unlocked(
             and _completion_outputs_match(previous_state)
             and (
                 isinstance(bundle.parsed.get("structure"), dict)
-                or _first_wave_preview_outputs_match(previous_state)
+                or _first_wave_preview_outputs_match(
+                    previous_state, project_dir,
+                )
             )
         ):
             published_state = previous_state.get("published")
@@ -1351,6 +1401,14 @@ def _build_companion_unlocked(
                     ],
                     validator_version=repaired_pdf[
                         "validator_version"
+                    ],
+                    render_identity=repaired_pdf["render_identity"],
+                    render_stem=repaired_pdf["render_stem"],
+                    render_identity_receipt_path=repaired_pdf[
+                        "render_identity_receipt_path"
+                    ],
+                    render_identity_receipt_sha256=repaired_pdf[
+                        "render_identity_receipt_sha256"
                     ],
                     source_credit_sha256=repaired_pdf[
                         "source_credit_sha256"
@@ -1549,6 +1607,18 @@ def _build_companion_unlocked(
             paper_id=bundle.paper_id,
             fingerprint=fingerprint,
             checkpoint_dir=str(checkpoint_dir),
+            **_checkpoint_identity_state(
+                project_dir, checkpoint_dir, fingerprint,
+            ),
+            **{
+                key: previous_state[key]
+                for key in (
+                    "checkpoint_alias_identity",
+                    "checkpoint_alias_receipt_path",
+                    "checkpoint_alias_receipt_sha256",
+                )
+                if previous_state.get(key)
+            },
             translation_mode="skipped" if options.skip_translation else "enabled",
             annotation_language=options.annotation_language,
             source_language=options.source_language,
@@ -1565,7 +1635,7 @@ def _build_companion_unlocked(
             "schema_version": "arc.companion.source-snapshot-receipt.v2",
             "paper_id": bundle.paper_id,
             "fingerprint": fingerprint,
-            "checkpoint_identity": checkpoint_dir.name,
+            "checkpoint_identity": fingerprint,
             "build_instance_id": build_instance_id,
             "build_request_sha256": build_request_sha256,
             "build_source_fingerprint": bootstrap_fingerprint,
@@ -1854,6 +1924,19 @@ def _build_companion_unlocked(
             preview_segment_count=first_wave_count,
             preview_segment_ids=[str(item["segment_id"]) for item in first_wave],
             first_wave_preview_version=FIRST_WAVE_PREVIEW_VERSION,
+            preview_content_sha256=preview["content_sha256"],
+            preview_render_identity=preview["render_identity"],
+            preview_render_stem=preview["render_stem"],
+            preview_render_identity_receipt_path=preview[
+                "render_identity_receipt_path"
+            ],
+            preview_render_identity_receipt_sha256=preview[
+                "render_identity_receipt_sha256"
+            ],
+            preview_render_recipe_sha256=preview[
+                "render_recipe_sha256"
+            ],
+            preview_validator_version=preview["validator_version"],
             preview_tex=preview["tex_path"],
             preview_pdf=preview["pdf_path"],
             preview_tex_sha256=preview["tex_sha256"],
@@ -2119,6 +2202,14 @@ def _build_companion_unlocked(
                 "render_recipe_sha256"
             ],
             validator_version=final_artifact["validator_version"],
+            render_identity=final_artifact["render_identity"],
+            render_stem=final_artifact["render_stem"],
+            render_identity_receipt_path=final_artifact[
+                "render_identity_receipt_path"
+            ],
+            render_identity_receipt_sha256=final_artifact[
+                "render_identity_receipt_sha256"
+            ],
             source_credit_sha256=final_artifact[
                 "source_credit_sha256"
             ],
@@ -5606,6 +5697,14 @@ def _build_chaptered_companion(
                    render_version=artifact["render_version"],
                    render_recipe_sha256=artifact["render_recipe_sha256"],
                    validator_version=artifact["validator_version"],
+                   render_identity=artifact["render_identity"],
+                   render_stem=artifact["render_stem"],
+                   render_identity_receipt_path=artifact[
+                       "render_identity_receipt_path"
+                   ],
+                   render_identity_receipt_sha256=artifact[
+                       "render_identity_receipt_sha256"
+                   ],
                    source_credit_sha256=artifact[
                        "source_credit_sha256"
                    ],
@@ -6269,7 +6368,16 @@ def _resume_companion_unlocked(
         return err("companion_not_supervised", "The companion build does not need supervision")
     active_run = state.get("active_run")
     active_run = active_run if isinstance(active_run, dict) else {}
-    checkpoint_dir = _checkpoint_dir_from_recovery_state(project_dir, state)
+    try:
+        checkpoint_dir = _checkpoint_dir_from_recovery_state(
+            project_dir, state,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return err(
+            "companion_checkpoint_invalid",
+            str(exc),
+            action=action,
+        )
     if not checkpoint_dir.is_dir():
         return err("companion_checkpoint_not_found", "The supervised checkpoint directory is missing")
     from .resume_transaction import (
@@ -6284,7 +6392,10 @@ def _resume_companion_unlocked(
     checkpoint_binding = bind_transaction_checkpoint(
         project_dir,
         checkpoint_path=checkpoint_dir,
-        checkpoint_fingerprint=str(state.get("fingerprint") or checkpoint_dir.name),
+        checkpoint_fingerprint=str(
+            state.get("fingerprint")
+            or _authoritative_build_fingerprint(checkpoint_dir)
+        ),
     )
     try:
         transaction = load_transaction(project_dir)
@@ -6692,7 +6803,8 @@ def _resume_companion_unlocked(
                 native_resume_contexts=native_resume_contexts,
                 checkpoint_path=checkpoint_dir,
                 checkpoint_fingerprint=str(
-                    state.get("fingerprint") or checkpoint_dir.name
+                    state.get("fingerprint")
+                    or _authoritative_build_fingerprint(checkpoint_dir)
                 ),
                 authorization_source=(
                     "recovery_policy_auto" if action == "auto" else "operator"
@@ -8419,12 +8531,22 @@ def _capture_recovery_source_authority(
     active_run = state.get("active_run")
     active_run = active_run if isinstance(active_run, dict) else {}
     expected_fingerprint = str(
-        state.get("fingerprint") or active_run.get("fingerprint") or ""
+        state.get("fingerprint")
+        or active_run.get("fingerprint")
+        or state.get("recovery_root_fingerprint")
+        or active_run.get("recovery_root_fingerprint")
+        or ""
     )
     if not expected_fingerprint:
         return None
-    checkpoint_dir = _checkpoint_dir_from_recovery_state(project_dir, state)
-    if not checkpoint_dir.is_dir() or checkpoint_dir.name != expected_fingerprint:
+    try:
+        checkpoint_dir = _checkpoint_dir_from_recovery_state(
+            project_dir, state,
+        )
+        _resolve_recovery_state_root(
+            project_dir, state, checkpoint_dir,
+        )
+    except (OSError, RuntimeError, ValueError):
         return None
     reference_tuple = tuple(
         (
@@ -8452,7 +8574,7 @@ def _capture_recovery_source_authority(
             or receipt.get("schema_version")
             != "arc.companion.source-snapshot-receipt.v2"
             or receipt.get("fingerprint") != expected_fingerprint
-            or receipt.get("checkpoint_identity") != checkpoint_dir.name
+            or receipt.get("checkpoint_identity") != expected_fingerprint
             or tuple(receipt.get(key) for key in _TRANSLATION_REFERENCE_STATE_KEYS)
             != reference_tuple
         ):
@@ -8524,16 +8646,19 @@ def _load_recovery_source_bundle(
 ) -> SourceBundle:
     """Load source normally, or verify and reuse the immutable build snapshot."""
 
-    authority = (
-        recovery_authority
-        if recovery_authority is not None
-        else _capture_recovery_source_authority(options)
-    )
+    authority = recovery_authority
     try:
         return (authoritative_source_loader or load_source_bundle)(
             paper_id, **dict(load_kwargs),
         )
     except SourceError as original_error:
+        if authority is None:
+            try:
+                authority = _capture_recovery_source_authority(
+                    options
+                )
+            except (OSError, RuntimeError, ValueError):
+                authority = None
         if authority is None:
             raise original_error
         checkpoint_dir = authority.checkpoint_dir
@@ -8716,7 +8841,7 @@ def _load_recovery_source_bundle(
                 common_valid = (
                     common_valid
                     and receipt.get("checkpoint_identity")
-                    == checkpoint_dir.name
+                    == authority.expected_fingerprint
                     and receipt.get("chapters_pack_sha256")
                     == (
                         sha256_json(chapters_payload)
@@ -8778,7 +8903,13 @@ def _checkpoint_dir_from_recovery_state(
     )
     if saved:
         candidate = Path(saved)
-        if candidate.is_dir():
+        try:
+            _resolve_recovery_state_root(
+                project_dir, state, candidate,
+            )
+        except (OSError, RuntimeError, ValueError):
+            pass
+        else:
             return candidate
     transaction = _read_checkpoint_json(
         project_dir / ".arc-companion" / "resume-transaction.json",
@@ -8793,13 +8924,186 @@ def _checkpoint_dir_from_recovery_state(
                 candidate = ledger_path.parents[2]
             except IndexError:
                 continue
+            try:
+                _resolve_recovery_state_root(
+                    project_dir, state, candidate,
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
             if (
-                candidate.is_dir()
-                and (candidate / "document.json").is_file()
+                (candidate / "document.json").is_file()
                 and (candidate / "sessions").is_dir()
             ):
                 return candidate
-    return Path(saved)
+    raise RuntimeError("recovery checkpoint state is invalid")
+
+
+def _resolve_recovery_state_root(
+    project_dir: Path,
+    state: Mapping[str, Any],
+    candidate: Path,
+) -> Path:
+    """Resolve a build checkpoint or the bounded intent-guidance recovery root."""
+
+    active_run = state.get("active_run")
+    active_run = active_run if isinstance(active_run, Mapping) else {}
+    recovery_kind = (
+        state.get("recovery_root_kind")
+        if "recovery_root_kind" in state
+        else active_run.get("recovery_root_kind")
+    )
+    is_intent_guidance = (
+        recovery_kind == "intent-guidance"
+        or (
+            recovery_kind is None
+            and state.get("status") == "building_intent_guidance"
+        )
+    )
+    if recovery_kind is not None and recovery_kind != "intent-guidance":
+        raise RuntimeError("recovery root kind is invalid")
+    if not is_intent_guidance:
+        return _resolve_checkpoint_state_identity(
+            project_dir, state, candidate,
+        ).path
+    project = project_dir.resolve(strict=False)
+    root = Path(os.path.abspath(
+        project / ".arc-companion" / "intent-guidance"
+    ))
+    raw = Path(os.path.abspath(candidate))
+    if (
+        raw.parent != root
+        or not raw.is_dir()
+    ):
+        raise RuntimeError("intent-guidance recovery root is invalid")
+    current = project
+    try:
+        relative = raw.relative_to(project)
+    except ValueError as exc:
+        raise RuntimeError(
+            "intent-guidance recovery root is invalid"
+        ) from exc
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(
+                "intent-guidance recovery root contains a symlink"
+            )
+    receipt = _read_checkpoint_json(
+        raw / "source-snapshot-receipt.json", root=raw,
+    )
+    expected = str(
+        state.get("recovery_root_fingerprint")
+        or active_run.get("recovery_root_fingerprint")
+        or state.get("fingerprint")
+        or active_run.get("fingerprint")
+        or ""
+    )
+    if (
+        not isinstance(receipt, Mapping)
+        or receipt.get("fingerprint") != expected
+        or receipt.get("checkpoint_identity") != expected
+    ):
+        raise RuntimeError(
+            "intent-guidance recovery receipt is invalid"
+        )
+    return raw.resolve()
+
+
+def _resolve_checkpoint_state_identity(
+    project_dir: Path,
+    state: Mapping[str, Any],
+    checkpoint_dir: Path,
+):
+    """Resolve the physical checkpoint behind one state-bound identity."""
+
+    active_run = state.get("active_run")
+    active_run = active_run if isinstance(active_run, Mapping) else {}
+
+    def state_value(key: str) -> object:
+        return state.get(key) if key in state else active_run.get(key)
+
+    expected = str(
+        state_value("fingerprint")
+        or state_value("checkpoint_identity")
+        or ""
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise RuntimeError("checkpoint state identity is invalid")
+    if (
+        state_value("checkpoint_identity") is not None
+        and state_value("checkpoint_identity") != expected
+    ):
+        raise RuntimeError("checkpoint state identities conflict")
+    checkpoint_root = project_dir / ".arc-companion" / "checkpoints"
+    alias_identity = state_value("checkpoint_alias_identity")
+    alias_path = state_value("checkpoint_alias_receipt_path")
+    alias_sha = state_value("checkpoint_alias_receipt_sha256")
+    alias_values = (alias_identity, alias_path, alias_sha)
+    if any(value is not None for value in alias_values):
+        if not all(isinstance(value, str) and value for value in alias_values):
+            raise RuntimeError("checkpoint alias state is incomplete")
+        if alias_identity != expected:
+            raise RuntimeError("checkpoint alias identity differs")
+        alias = read_artifact_alias_receipt(
+            checkpoint_root, expected,
+        )
+        if alias is None:
+            raise RuntimeError("checkpoint alias receipt is missing")
+        if (
+            Path(str(alias_path)).absolute()
+            != alias.path.absolute()
+            or alias.sha256 != alias_sha
+        ):
+            raise RuntimeError("checkpoint alias receipt state differs")
+        value = alias.value
+        if (
+            set(value) != {
+                "schema_version",
+                "kind",
+                "alias_identity",
+                "legacy_fingerprint",
+                "content_fingerprint",
+                "legacy_checkpoint_dir",
+                "legacy_workers_per_lane",
+            }
+            or value.get("schema_version")
+            != "arc.companion.checkpoint-alias.v1"
+            or value.get("kind")
+            != "workers-to-total-concurrency-budget"
+            or value.get("alias_identity") != expected
+            or value.get("content_fingerprint") != expected
+            or Path(
+                str(value.get("legacy_checkpoint_dir") or "")
+            ).resolve(strict=False)
+            != checkpoint_dir.resolve(strict=False)
+        ):
+            raise RuntimeError("checkpoint alias receipt is invalid")
+        physical_identity = str(
+            value.get("legacy_fingerprint") or ""
+        )
+    else:
+        physical_identity = expected
+    allocation = resolve_artifact_dir(
+        checkpoint_root,
+        checkpoint_dir,
+        expected_identity=physical_identity,
+        kind="checkpoint",
+    )
+    receipt_path = state_value("checkpoint_identity_receipt_path")
+    receipt_sha = state_value("checkpoint_identity_receipt_sha256")
+    if (receipt_path is None) != (receipt_sha is None):
+        raise RuntimeError("checkpoint identity receipt state is incomplete")
+    if receipt_path is not None:
+        if (
+            allocation.receipt_path is None
+            or Path(str(receipt_path)).absolute()
+            != allocation.receipt_path.absolute()
+            or receipt_sha != allocation.receipt_sha256
+        ):
+            raise RuntimeError("checkpoint identity receipt state differs")
+    elif allocation.receipt_path is not None:
+        raise RuntimeError("checkpoint identity receipt state is missing")
+    return allocation
 
 
 def _validate_native_resume_context(
@@ -9970,11 +10274,38 @@ def _publish_pdf_artifact(
     # Every final or preview render gets an immutable revision directory.
     # A failed later preview therefore cannot delete or partially overwrite
     # the last successful preview referenced by state.
-    artifact_dir = (
-        output_dir / ".arc-companion" / "renders" / "pdf"
-        / f"{safe_name(stem)}-{uuid.uuid4().hex[:12]}"
-    )
-    artifact_dir.mkdir(parents=True, exist_ok=False)
+    directory_stem = safe_name(stem)[:48].strip("-_") or "companion"
+    for _identity_attempt in range(8):
+        render_nonce = uuid.uuid4().hex
+        render_payload = {
+            "content_sha256": content_sha256,
+            "render_recipe_sha256": pdf_render_recipe_sha256(),
+            "validator_version": (
+                PDF_VALIDATOR_VERSION
+                if pdf_validator is validate_pdf else "custom-validator"
+            ),
+            "stem": directory_stem,
+        }
+        render_identity = render_artifact_identity(
+            kind="pdf-render",
+            payload=render_payload,
+            nonce=render_nonce,
+        )
+        render_allocation = allocate_artifact_dir(
+            output_dir / ".arc-companion" / "renders" / "pdf",
+            render_identity,
+            kind="pdf-render",
+            stem=directory_stem,
+            payload=render_payload,
+            nonce=render_nonce,
+            allow_legacy=False,
+        )
+        if render_allocation.disposition == "created":
+            break
+    else:
+        raise LatexError("could not allocate a fresh PDF render identity")
+    artifact_dir = render_allocation.path
+    identity_receipt = artifact_dir / ARTIFACT_ID_RECEIPT_NAME
     try:
         evidence_by_segment = _reader_evidence_by_segment(
             segments,
@@ -10010,7 +10341,8 @@ def _publish_pdf_artifact(
                 + "; ".join(fidelity_errors)
             )
     except BaseException:
-        shutil.rmtree(artifact_dir, ignore_errors=True)
+        if render_allocation.disposition == "created":
+            shutil.rmtree(artifact_dir, ignore_errors=True)
         raise
 
     tex_path = artifact_dir / f"{stem}.tex"
@@ -10131,11 +10463,16 @@ def _publish_pdf_artifact(
                 validation_path,
             ):
                 path.unlink(missing_ok=True)
-            shutil.rmtree(artifact_dir, ignore_errors=True)
+            if render_allocation.disposition == "created":
+                shutil.rmtree(artifact_dir, ignore_errors=True)
         raise
 
     return {
         "content_sha256": content_sha256,
+        "render_identity": render_identity,
+        "render_stem": directory_stem,
+        "render_identity_receipt_path": str(identity_receipt),
+        "render_identity_receipt_sha256": sha256_file(identity_receipt),
         "render_version": FINAL_RENDER_VERSION,
         "render_recipe_sha256": pdf_render_recipe_sha256(),
         "validator_version": (
@@ -19443,6 +19780,23 @@ def _legacy_worker_fingerprint(
     return sha256_json({**payload, "workers_per_lane": workers_per_lane})
 
 
+def _checkpoint_identity_state(
+    project_dir: Path,
+    checkpoint_dir: Path,
+    fingerprint: str,
+) -> dict[str, Any]:
+    receipt = checkpoint_dir / ARTIFACT_ID_RECEIPT_NAME
+    values: dict[str, Any] = {
+        "checkpoint_identity": fingerprint,
+    }
+    if receipt.is_file():
+        values.update({
+            "checkpoint_identity_receipt_path": str(receipt),
+            "checkpoint_identity_receipt_sha256": sha256_file(receipt),
+        })
+    return values
+
+
 def _checkpoint_dir_with_legacy_worker_migration(
     project_dir: Path,
     *,
@@ -19453,21 +19807,106 @@ def _checkpoint_dir_with_legacy_worker_migration(
     domain_context: dict[str, Any] | None,
     previous_state: dict[str, Any],
 ) -> Path:
-    """Move an exactly matched pre-total-budget checkpoint into its content identity."""
+    """Alias an exact pre-total-budget checkpoint without renaming it."""
     checkpoint_root = project_dir / ".arc-companion" / "checkpoints"
-    target = checkpoint_root / fingerprint
-    if target.exists() or options.force:
-        return target
+    for key in (
+        "checkpoint_alias_identity",
+        "checkpoint_alias_receipt_path",
+        "checkpoint_alias_receipt_sha256",
+    ):
+        previous_state.pop(key, None)
+    existing_alias = (
+        read_artifact_alias_receipt(checkpoint_root, fingerprint)
+        if checkpoint_root.is_dir() else None
+    )
+    if existing_alias is not None:
+        alias = existing_alias.value
+        legacy_fingerprint = str(alias.get("legacy_fingerprint") or "")
+        legacy_path = Path(str(alias.get("legacy_checkpoint_dir") or ""))
+        resolved = resolve_artifact_dir(
+            checkpoint_root, legacy_path,
+            expected_identity=legacy_fingerprint,
+            kind="checkpoint",
+        )
+        if (
+            alias.get("schema_version")
+            != "arc.companion.checkpoint-alias.v1"
+            or alias.get("content_fingerprint") != fingerprint
+            or alias.get("kind")
+            != "workers-to-total-concurrency-budget"
+            or alias.get("alias_identity") != fingerprint
+            or set(alias) != {
+                "schema_version",
+                "kind",
+                "alias_identity",
+                "legacy_fingerprint",
+                "content_fingerprint",
+                "legacy_checkpoint_dir",
+                "legacy_workers_per_lane",
+            }
+        ):
+            raise RuntimeError("checkpoint alias receipt is invalid")
+        previous_state.update({
+            "fingerprint": fingerprint,
+            "checkpoint_dir": str(resolved.path),
+            "checkpoint_alias_identity": fingerprint,
+            "checkpoint_alias_receipt_path": str(existing_alias.path),
+            "checkpoint_alias_receipt_sha256": existing_alias.sha256,
+        })
+        return resolved.path
+
+    if checkpoint_root.is_dir():
+        for length in (*range(12, 64, 4), 64):
+            candidate = checkpoint_root / fingerprint[:length]
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            try:
+                mode = candidate.lstat().st_mode
+            except OSError as exc:
+                raise RuntimeError(
+                    "checkpoint identity candidate is unreadable"
+                ) from exc
+            if not stat.S_ISDIR(mode):
+                if stat.S_ISLNK(mode):
+                    raise RuntimeError(
+                        "checkpoint identity candidate is invalid"
+                    )
+                continue
+            receipt = candidate / ARTIFACT_ID_RECEIPT_NAME
+            if not receipt.exists() and candidate.name != fingerprint:
+                continue
+            try:
+                allocation = resolve_artifact_dir(
+                    checkpoint_root, candidate,
+                    kind="checkpoint",
+                    expected_identity=(
+                        fingerprint
+                        if candidate.name == fingerprint else None
+                    ),
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    "checkpoint identity candidate is invalid"
+                ) from exc
+            if allocation.identity == fingerprint:
+                return allocation.path
+    if options.force:
+        return allocate_artifact_dir(
+            checkpoint_root, fingerprint, kind="checkpoint",
+        ).path
 
     context_workers = _read_optional_json(project_dir / "context.json").get("workers")
+    recovery = previous_state.get("recovery_options")
+    recovery = recovery if isinstance(recovery, Mapping) else {}
     candidates: list[int] = []
-    if (
-        not isinstance(context_workers, bool)
-        and isinstance(context_workers, int)
-        and context_workers > 0
-    ):
-        candidates.append(context_workers)
-    candidates.extend(value for value in range(1, 1025) if value not in candidates)
+    for value in (recovery.get("workers"), context_workers):
+        if (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and value > 0
+            and value not in candidates
+        ):
+            candidates.append(value)
 
     recorded_fingerprint = previous_state.get("fingerprint")
     legacy_workers: int | None = None
@@ -19487,31 +19926,48 @@ def _checkpoint_dir_with_legacy_worker_migration(
             legacy_fingerprint = candidate_fingerprint
             break
     if legacy_workers is None or legacy_fingerprint is None:
-        return target
-    legacy = checkpoint_root / legacy_fingerprint
+        return allocate_artifact_dir(
+            checkpoint_root, fingerprint, kind="checkpoint",
+        ).path
     recorded_checkpoint = previous_state.get("checkpoint_dir")
-    if (
-        not recorded_checkpoint
-        or Path(str(recorded_checkpoint)).resolve() != legacy.resolve()
-        or not legacy.is_dir()
-    ):
-        return target
+    if not recorded_checkpoint:
+        return allocate_artifact_dir(
+            checkpoint_root, fingerprint, kind="checkpoint",
+        ).path
+    try:
+        legacy = resolve_artifact_dir(
+            checkpoint_root,
+            Path(str(recorded_checkpoint)),
+            expected_identity=legacy_fingerprint,
+            kind="checkpoint",
+        ).path
+    except (OSError, RuntimeError, ValueError):
+        return allocate_artifact_dir(
+            checkpoint_root, fingerprint, kind="checkpoint",
+        ).path
 
-    checkpoint_root.mkdir(parents=True, exist_ok=True)
-    os.replace(legacy, target)
-    write_json(target / "checkpoint-migration.v1.json", {
-        "schema_version": "arc.companion.checkpoint-migration.v1",
+    alias_value = {
+        "schema_version": "arc.companion.checkpoint-alias.v1",
         "kind": "workers-to-total-concurrency-budget",
+        "alias_identity": fingerprint,
         "legacy_fingerprint": legacy_fingerprint,
         "content_fingerprint": fingerprint,
+        "legacy_checkpoint_dir": str(legacy),
         "legacy_workers_per_lane": legacy_workers,
-        "migrated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    alias_receipt = ensure_artifact_alias_receipt(
+        checkpoint_root, fingerprint, alias_value,
+    )
+    if dict(alias_receipt.value) != alias_value:
+        raise RuntimeError("checkpoint alias receipt conflicts")
+    previous_state.update({
+        "fingerprint": fingerprint,
+        "checkpoint_dir": str(legacy),
+        "checkpoint_alias_identity": fingerprint,
+        "checkpoint_alias_receipt_path": str(alias_receipt.path),
+        "checkpoint_alias_receipt_sha256": alias_receipt.sha256,
     })
-    # Preserve completion/preview recovery in this invocation. The migration
-    # proved that only the legacy operational worker field changed.
-    previous_state["fingerprint"] = fingerprint
-    previous_state["checkpoint_dir"] = str(target)
-    return target
+    return legacy
 
 
 def _page_count(bundle: SourceBundle) -> int | None:
@@ -19620,7 +20076,9 @@ def _web_outputs_match(
     )
 
 
-def _first_wave_preview_outputs_match(state: dict[str, Any]) -> bool:
+def _first_wave_preview_outputs_match(
+    state: dict[str, Any], project_dir: Path,
+) -> bool:
     if state.get("first_wave_preview_version") != FIRST_WAVE_PREVIEW_VERSION:
         return False
     try:
@@ -19644,14 +20102,101 @@ def _first_wave_preview_outputs_match(state: dict[str, Any]) -> bool:
         ("preview_source_manifest_path", "preview_source_manifest_sha256"),
         ("preview_validation_path", "preview_validation_sha256"),
     )
+    render_identity = str(
+        state.get("preview_render_identity") or ""
+    )
+    render_stem = str(state.get("preview_render_stem") or "")
+    content_sha256 = str(
+        state.get("preview_content_sha256") or ""
+    )
+    recipe = str(
+        state.get("preview_render_recipe_sha256") or ""
+    )
+    validator = str(
+        state.get("preview_validator_version") or ""
+    )
+    identity_receipt = Path(str(
+        state.get("preview_render_identity_receipt_path") or ""
+    ))
+    identity_receipt_sha = str(
+        state.get("preview_render_identity_receipt_sha256") or ""
+    )
+    if not all((
+        render_identity,
+        render_stem,
+        content_sha256,
+        recipe,
+        validator,
+        str(identity_receipt),
+        identity_receipt_sha,
+    )):
+        return False
+    try:
+        allocation = resolve_artifact_dir(
+            project_dir / ".arc-companion" / "renders" / "pdf",
+            identity_receipt.parent,
+            expected_identity=render_identity,
+            kind="pdf-render",
+            stem=render_stem,
+            allow_legacy=False,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        allocation.receipt_path.absolute() != identity_receipt.absolute()
+        or allocation.receipt_sha256 != identity_receipt_sha
+        or allocation.payload != {
+            "content_sha256": content_sha256,
+            "render_recipe_sha256": recipe,
+            "validator_version": validator,
+            "stem": render_stem,
+        }
+        or allocation.nonce is None
+    ):
+        return False
+    revision_parent = allocation.path
     for path_key, hash_key in checks:
         value = state.get(path_key)
         expected = str(state.get(hash_key) or "")
         if not value or not expected:
             return False
         path = Path(str(value))
-        if not path.is_file() or path.stat().st_size == 0 or sha256_file(path) != expected:
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
             return False
+        if (
+            stat.S_ISLNK(mode)
+            or not stat.S_ISREG(mode)
+            or path.parent.absolute() != revision_parent.absolute()
+            or path.stat().st_size == 0
+            or sha256_file(path) != expected
+        ):
+            return False
+    validation = _read_optional_json(
+        Path(str(state["preview_validation_path"]))
+    )
+    if (
+        not pdf_validation_receipt_is_closed(
+            validation,
+            scope="preview",
+            reusable=False,
+            validator_version=validator,
+        )
+        or validation.get("content_sha256") != content_sha256
+        or validation.get("render_recipe_sha256") != recipe
+        or validation.get("validator_version") != validator
+        or validation.get("pdf_sha256")
+        != state.get("preview_pdf_sha256")
+        or validation.get("tex_sha256")
+        != state.get("preview_tex_sha256")
+        or validation.get("source_manifest_sha256")
+        != state.get("preview_source_manifest_sha256")
+        or not isinstance(validation.get("pdf"), Mapping)
+        or validation["pdf"].get("pdf_bytes")
+        != Path(str(state["preview_pdf"])).stat().st_size
+    ):
+        return False
     return True
 
 
@@ -22772,6 +23317,10 @@ def _refresh_completed_source_credit_only(
                     "render_version",
                     "render_recipe_sha256",
                     "validator_version",
+                    "render_identity",
+                    "render_stem",
+                    "render_identity_receipt_path",
+                    "render_identity_receipt_sha256",
                     "source_credit_sha256",
                     "source_credit_observation_sha256",
                 )
@@ -23193,6 +23742,22 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
             for key, value in previous.items()
             if not _fingerprint_bound_state_key(key)
         }
+    if "checkpoint_identity" in values:
+        for key in (
+            "checkpoint_identity",
+            "checkpoint_identity_receipt_path",
+            "checkpoint_identity_receipt_sha256",
+            "checkpoint_alias_identity",
+            "checkpoint_alias_receipt_path",
+            "checkpoint_alias_receipt_sha256",
+        ):
+            previous.pop(key, None)
+        if values.get("checkpoint_identity") is not None:
+            previous.pop("recovery_root_kind", None)
+            previous.pop("recovery_root_fingerprint", None)
+    if "recovery_root_kind" in values:
+        previous.pop("recovery_root_kind", None)
+        previous.pop("recovery_root_fingerprint", None)
     if "notice" in values and values["notice"] is None:
         previous.pop("notice", None)
     if values.get("build_instance_id") is not None:
@@ -23230,6 +23795,9 @@ def _state(path: Path, **values: Any) -> dict[str, Any]:
                 "source_manifest_path", "source_manifest_sha256", "validation_path",
                 "validation_sha256", "final_render_version",
                 "render_version", "render_recipe_sha256",
+                "render_identity", "render_stem",
+                "render_identity_receipt_path",
+                "render_identity_receipt_sha256",
                 "validator_version", "source_credit_sha256",
                 "source_credit_observation_sha256",
             )
@@ -23284,6 +23852,12 @@ def _fingerprint_bound_state_key(key: str) -> bool:
     return key in {
         "fingerprint",
         "checkpoint_dir",
+        "checkpoint_identity",
+        "checkpoint_identity_receipt_path",
+        "checkpoint_identity_receipt_sha256",
+        "checkpoint_alias_identity",
+        "checkpoint_alias_receipt_path",
+        "checkpoint_alias_receipt_sha256",
         "segment_count",
         "annotation_language",
         "first_wave_preview_version",

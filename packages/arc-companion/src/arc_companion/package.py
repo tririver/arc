@@ -163,7 +163,20 @@ def package_project(project_dir: Path) -> dict[str, object]:
         if not validation_success:
             raise ValueError("Companion validation report is not successful")
         source_manifest = read_json(source_manifest_path)
-        files = [pdf_path, tex_path, source_manifest_path, validation_path, state_path]
+        files = [
+            pdf_path,
+            tex_path,
+            source_manifest_path,
+            validation_path,
+            state_path,
+        ]
+        if effective.get("render_identity"):
+            files.append(_state_hashed_file(
+                root,
+                effective,
+                "render_identity_receipt_path",
+                "render_identity_receipt_sha256",
+            ))
         for asset in source_manifest.get("assets") or []:
             if not isinstance(asset, dict) or not asset.get("output_path"):
                 raise ValueError("Source manifest contains an invalid TeX asset")
