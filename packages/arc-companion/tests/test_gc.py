@@ -31,7 +31,12 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_historical_reader(root: Path) -> tuple[Path, Path, Path]:
+def _write_historical_reader(
+    root: Path,
+    *,
+    manifest_version: str = WEB_MANIFEST_VERSION,
+    malformed_snapshot_record: bool = False,
+) -> tuple[Path, Path, Path]:
     data_dir = root / "reader" / "data"
     data_dir.mkdir(parents=True)
     snapshot_bytes = json.dumps({
@@ -45,7 +50,7 @@ def _write_historical_reader(root: Path) -> tuple[Path, Path, Path]:
     script = data_dir / f"snapshot-{script_sha}.js"
     script.write_bytes(script_bytes)
     manifest_value = {
-        "schema_version": WEB_MANIFEST_VERSION,
+        "schema_version": manifest_version,
         "snapshot": {
             "path": snapshot.relative_to(root).as_posix(),
             "sha256": snapshot_sha,
@@ -63,6 +68,8 @@ def _write_historical_reader(root: Path) -> tuple[Path, Path, Path]:
         },
         "assets": [],
     }
+    if malformed_snapshot_record:
+        manifest_value["snapshot"].pop("sha256")
     manifest_bytes = json.dumps(
         manifest_value, sort_keys=True, separators=(",", ":"),
     ).encode()
@@ -169,6 +176,74 @@ def test_gc_discovers_reader_and_render_history_and_applies(
     assert all(not path.exists() for path in reader_paths)
     assert (tmp_path / result["receipt_path"]).is_file()
     assert gc.discover_gc(tmp_path).status == "no_op"
+
+
+def test_gc_accepts_immediate_legacy_reader_manifest_history(
+    tmp_path: Path,
+) -> None:
+    _write_state(tmp_path)
+    manifest, snapshot, script = _write_historical_reader(
+        tmp_path,
+        manifest_version="arc.companion.web-manifest.v2",
+    )
+    with pytest.raises(
+        gc.CompanionGCError, match="manifest schema is invalid",
+    ):
+        gc._manifest_graph(tmp_path, manifest)
+
+    report = gc.discover_gc(tmp_path)
+
+    assert {
+        candidate.path for candidate in report.candidates
+    } == {
+        path.relative_to(tmp_path).as_posix()
+        for path in (manifest, snapshot, script)
+    }
+    result = gc.apply_gc(
+        tmp_path, candidate_digest=report.candidate_set_sha256,
+    )
+    assert result["deleted_count"] == 3
+    assert all(not path.exists() for path in (manifest, snapshot, script))
+
+
+@pytest.mark.parametrize(
+    "manifest_version",
+    [
+        "arc.companion.web-manifest.v1",
+        "arc.companion.web-manifest.v4",
+    ],
+)
+def test_gc_rejects_unknown_reader_manifest_history_schema(
+    tmp_path: Path,
+    manifest_version: str,
+) -> None:
+    _write_state(tmp_path)
+    _write_historical_reader(
+        tmp_path, manifest_version=manifest_version,
+    )
+
+    with pytest.raises(
+        gc.CompanionGCError, match="manifest schema is invalid",
+    ) as error:
+        gc.discover_gc(tmp_path)
+    assert error.value.code == "gc_reader_invalid"
+
+
+def test_gc_rejects_malformed_legacy_reader_manifest_history(
+    tmp_path: Path,
+) -> None:
+    _write_state(tmp_path)
+    _write_historical_reader(
+        tmp_path,
+        manifest_version="arc.companion.web-manifest.v2",
+        malformed_snapshot_record=True,
+    )
+
+    with pytest.raises(
+        gc.CompanionGCError, match="file identity is incomplete",
+    ) as error:
+        gc.discover_gc(tmp_path)
+    assert error.value.code == "gc_reader_invalid"
 
 
 def test_gc_apply_recovers_move_before_journal_update(

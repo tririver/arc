@@ -48,6 +48,10 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MANIFEST_NAME = re.compile(r"manifest-([0-9a-f]{64})\.json")
 _SNAPSHOT_NAME = re.compile(r"snapshot-([0-9a-f]{64})\.json")
 _DATA_NAME = re.compile(r"snapshot-([0-9a-f]{64})\.js")
+_READER_HISTORY_MANIFEST_VERSIONS = {
+    "arc.companion.web-manifest.v2",
+    WEB_MANIFEST_VERSION,
+}
 _BUILTIN_NAME = re.compile(r"builtin-([0-9a-f]{64})")
 _SOURCE_NAME = re.compile(
     r"([0-9a-f]{64})(\.(?:png|jpg|jpeg|gif|webp|svg))",
@@ -524,7 +528,7 @@ def _reader_discovery(
             data_match = _DATA_NAME.fullmatch(entry.name)
             if match:
                 _require_filename_hash(root, entry, match.group(1))
-                _manifest_graph(root, entry)
+                _manifest_graph(root, entry, history=True)
                 if relative not in current_graph and not _rooted(
                     relative, extra_roots,
                 ):
@@ -1167,7 +1171,12 @@ def _directory_candidate(
     )
 
 
-def _manifest_graph(root: Path, manifest_path: Path) -> set[str]:
+def _manifest_graph(
+    root: Path,
+    manifest_path: Path,
+    *,
+    history: bool = False,
+) -> set[str]:
     value = _json_object(
         _read_regular_bytes(
             root, manifest_path, max_bytes=MAX_JSON_BYTES,
@@ -1175,7 +1184,12 @@ def _manifest_graph(root: Path, manifest_path: Path) -> set[str]:
         ),
         "gc_reader_invalid",
     )
-    if value.get("schema_version") != WEB_MANIFEST_VERSION:
+    accepted_versions = (
+        _READER_HISTORY_MANIFEST_VERSIONS
+        if history
+        else {WEB_MANIFEST_VERSION}
+    )
+    if value.get("schema_version") not in accepted_versions:
         raise CompanionGCError(
             "gc_reader_invalid", "Reader history manifest schema is invalid",
         )
