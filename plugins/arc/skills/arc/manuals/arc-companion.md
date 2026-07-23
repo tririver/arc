@@ -557,6 +557,31 @@ the surrounding workflows retain their own sizes. Content objects, accepted
 artifacts, provider call checkpoints, sessions, segments, and other
 content-addressed records keep their full 64-character identities.
 
+Final publication performs best-effort latest-only cleanup after the new
+Reader/PDF state and run-root delivery are durable. It does not run for
+unchanged renders, delivery-only repair, previews, first-chapter output,
+failures, or supervised state. Cleanup failure never rolls back a valid
+publication; `state.json` records either the terminal GC receipt identity or a
+bounded `artifact_gc_warning`.
+
+Use dry-run discovery before an explicit cleanup:
+
+```bash
+arc-companion gc --project-dir <dir> --json
+arc-companion gc --project-dir <dir> --apply \
+  --candidate-digest <candidate-set-sha256> --json
+```
+
+Only state-validated historical Reader objects, old PDF render revisions, and
+exact legacy validation sidecars are eligible. Current publications,
+checkpoints, reviewed-content objects, caches, recovery journals, provenance,
+and package inputs are retained. Repeat `--extra-root
+<project-relative-path>` for additional roots that must remain. Unknown owned
+paths are reported and retained. Active builds, malformed recognized paths,
+symbolic links, changed identities, and incomplete transactions refuse
+deletion. Interrupted apply transactions resume forward from
+`.arc-companion/gc/` under the project build lock.
+
 Create a reproducibility package only when explicitly requested:
 
 ```bash

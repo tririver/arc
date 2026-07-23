@@ -88,8 +88,31 @@ files produced by older renders. Historical files such as
 `*.validation.txt` and `*.validation-page-<N>.png` remain untouched during PDF
 matching, rendering, validation, packaging, and delivery repair.
 
-Removal of those legacy sidecars belongs to the T20 garbage-collection and
-retention work. Until that cleanup runs, do not treat their presence as part of
-the current PDF identity and do not delete them as an incidental render or
-repair step. Current canonical TeX, PDF, source manifest, validation receipt,
+Latest-only garbage collection runs after a newly published final build or
+render. It retains the state-selected Reader graph, current validated PDF
+revision, managed run-root PDF, checkpoints, reviewed-content objects, caches,
+recovery journals, and provenance. It removes only strictly recognized
+historical Reader objects and render revisions, plus exact legacy validation
+sidecars. A no-op render, delivery repair, preview, first-chapter build, failed
+build, or supervised build does not trigger cleanup.
+
+Inspect the exact candidate set without writing, then optionally require that
+same digest while applying:
+
+```bash
+arc-companion gc --project-dir <dir> --json
+arc-companion gc --project-dir <dir> --apply \
+  --candidate-digest <candidate-set-sha256> --json
+```
+
+Apply uses the project build lock, revalidates every candidate, quarantines by
+atomic rename, and writes recoverable transaction and terminal receipt records
+under `.arc-companion/gc/`. An interrupted transaction resumes forward on the
+next apply. Unknown owned paths are reported and retained. Malformed recognized
+paths, symbolic links, active builds, conflicting transactions, or changed
+publication roots cause a stable refusal rather than speculative deletion.
+`--extra-root <project-relative-path>` may be repeated to retain additional
+hash-bound roots.
+
+Current canonical TeX, PDF, source manifest, validation receipt,
 reviewed-content objects, and published state remain protected artifacts.

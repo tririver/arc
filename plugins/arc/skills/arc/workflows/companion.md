@@ -425,6 +425,24 @@ readability/path-length change, not disk compression: the measured Barthes run
 still retained about 42 MB of checkpoints and 381 MB of immutable renders,
 while evidence, translation, and version stores retained their own sizes.
 
+New final publications automatically run best-effort latest-only GC while the
+build lock remains held. This removes only strictly recognized superseded
+Reader/render history; it permanently retains current outputs, checkpoints,
+reviewed-content objects, recovery caches, audit records, provenance, package
+inputs, and unknown user files. A cleanup warning does not invalidate the
+published result. For explicit review, inspect the deterministic dry-run and
+bind apply to its candidate digest:
+
+```bash
+arc-companion gc --project-dir <project-dir> --json
+arc-companion gc --project-dir <project-dir> --apply \
+  --candidate-digest <candidate-set-sha256> --json
+```
+
+If apply was interrupted, rerun the same command so the journaled quarantine
+can resume forward. Treat a refusal as a request to inspect project state; GC
+is not a general filesystem cleaner.
+
 ```bash
 arc-companion package --project-dir <project-dir> --json
 ```

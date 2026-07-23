@@ -84,6 +84,7 @@ def render_content(
     reader_state_before: bytes | None = None
     reader_state_owned: bytes | None = None
     state_committed = False
+    reader_published = False
     try:
         state = _state(root)
         published_digest = str(
@@ -293,6 +294,7 @@ def render_content(
                 reader_result = coordinator.request(
                     lambda: overrides, final=True, strict=True,
                 )
+            reader_published = reader_result.published
             web = {
                 key: value for key, value in reader_result.state.items()
                 if key in {
@@ -345,6 +347,19 @@ def render_content(
                 content_sha256=digest,
                 outputs={"pdf": published["pdf"]},
                 render_format=format,
+            )
+        if (
+            (format in {"pdf", "all"} and not pdf_reused)
+            or reader_published
+        ):
+            from .gc import run_post_publication_gc
+
+            run_post_publication_gc(
+                root,
+                state_merger=lambda values: _merge_gc_state(
+                    root, dict(values),
+                ),
+                lock_already_held=True,
             )
         phase_times["total"] = time.monotonic() - started
         data = {
@@ -800,6 +815,19 @@ def _publish_state(
             active_run.pop("error", None)
             merged["active_run"] = active_run
     merged["updated_at"] = datetime.now(timezone.utc).isoformat()
+    write_json(root / "state.json", merged)
+    return merged
+
+
+def _merge_gc_state(root: Path, values: dict[str, Any]) -> dict[str, Any]:
+    merged = _state(root)
+    for key in ("artifact_gc", "artifact_gc_warning"):
+        value = values.get(key)
+        if value is None:
+            merged.pop(key, None)
+        elif key in values:
+            merged[key] = value
+    merged["schema_version"] = "arc.companion.state.v3"
     write_json(root / "state.json", merged)
     return merged
 

@@ -253,6 +253,27 @@ def main(argv: list[str] | None = None) -> int:
     package.add_argument("--project-dir", required=True)
     package.add_argument("--json", action="store_true")
 
+    gc = sub.add_parser(
+        "gc", help="Discover or apply exact latest-only artifact cleanup",
+    )
+    gc.add_argument("--project-dir", required=True)
+    gc.add_argument(
+        "--apply", action="store_true",
+        help="quarantine and delete the exact current candidate set",
+    )
+    gc.add_argument(
+        "--candidate-digest",
+        default=None,
+        help="require this dry-run candidate-set SHA-256 before applying",
+    )
+    gc.add_argument(
+        "--extra-root",
+        action="append",
+        default=[],
+        help="repeat to retain an additional project-relative root",
+    )
+    gc.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
     try:
         result = _dispatch(args)
@@ -382,6 +403,15 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         )
     elif args.command == "package":
         result = package_project(Path(args.project_dir))
+    elif args.command == "gc":
+        from .gc import gc_project
+
+        result = gc_project(
+            Path(args.project_dir),
+            apply=args.apply,
+            candidate_digest=args.candidate_digest,
+            extra_roots=tuple(args.extra_root),
+        )
     else:
         raise AssertionError(f"Unhandled command: {args.command}")
     return result

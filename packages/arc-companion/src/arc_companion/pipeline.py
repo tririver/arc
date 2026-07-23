@@ -707,6 +707,32 @@ def build_companion(
             retryable=True,
         )
     try:
+        state_path = project_dir / "state.json"
+        publication_before = _gc_publication_identity(
+            _read_optional_json(state_path),
+        )
+
+        def finish(result: dict[str, Any]) -> dict[str, Any]:
+            latest = _read_optional_json(state_path)
+            data = result.get("data")
+            if (
+                result.get("ok") is True
+                and isinstance(data, Mapping)
+                and latest.get("status") == "complete"
+                and _gc_publication_identity(latest) != publication_before
+            ):
+                from .gc import run_post_publication_gc
+
+                run_post_publication_gc(
+                    project_dir,
+                    state_merger=lambda values: _merge_gc_state(
+                        state_path, dict(values),
+                    ),
+                    lock_already_held=True,
+                )
+                return {**result, "data": _read_optional_json(state_path)}
+            return result
+
         from arc_llm.cancellation import install_signal_cancel_chain
 
         with install_signal_cancel_chain() as cancel_check:
@@ -731,7 +757,7 @@ def build_companion(
                 recovery_authority = (
                     current_recovery_authority or entry_recovery_authority
                 )
-                return _resume_companion_unlocked(
+                return finish(_resume_companion_unlocked(
                     options.project_dir.resolve(),
                     action="auto",
                     cancel_check=cancel_check,
@@ -757,10 +783,56 @@ def build_companion(
                         recovery_authority=recovery_authority,
                         authoritative_source_loader=source_loader,
                     ),
-                )
-            return result
+                ))
+            return finish(result)
     finally:
         lock.release()
+
+
+def _gc_publication_identity(state: Mapping[str, Any]) -> str:
+    published = state.get("published")
+    published = published if isinstance(published, Mapping) else {}
+    pdf = published.get("pdf")
+    pdf = pdf if isinstance(pdf, Mapping) else {}
+    web = published.get("web")
+    web = web if isinstance(web, Mapping) else {}
+    return sha256_json({
+        "content_sha256": published.get("content_sha256"),
+        "pdf": {
+            key: pdf.get(key)
+            for key in (
+                "output_pdf",
+                "output_pdf_sha256",
+                "render_identity",
+                "validation_sha256",
+                "output_run_pdf",
+                "output_run_pdf_sha256",
+            )
+        },
+        "web": {
+            key: web.get(key)
+            for key in (
+                "output_html_sha256",
+                "reader_snapshot_sha256",
+                "web_manifest_sha256",
+                "web_render_version",
+            )
+        },
+    })
+
+
+def _merge_gc_state(
+    state_path: Path, values: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = _read_optional_json(state_path)
+    for key in ("artifact_gc", "artifact_gc_warning"):
+        value = values.get(key)
+        if value is None:
+            merged.pop(key, None)
+        elif key in values:
+            merged[key] = value
+    write_json(state_path, merged)
+    return merged
 
 
 def _build_companion_unlocked(
