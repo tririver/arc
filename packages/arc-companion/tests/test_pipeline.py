@@ -362,7 +362,11 @@ def test_completed_credit_only_refresh_reuses_reviewed_content_without_provider_
         "publish_run_root_pdf",
         lambda *args, **kwargs: {},
     )
-    monkeypatch.setattr(pipeline_module, "_web_outputs_match", lambda _state: True)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_web_outputs_match",
+        lambda _project, _state: True,
+    )
 
     refused = pipeline_module._refresh_completed_source_credit_only(
         options=options,
@@ -4493,6 +4497,30 @@ def test_build_uses_tiered_parallel_lanes_and_is_source_faithful_and_resumable(t
     ).read_bytes()
 
     state_path = tmp_path / "run" / "state.json"
+    repaired_manifest = read_json(
+        Path(resumed["data"]["web_manifest_path"])
+    )
+    missing_data = (
+        (tmp_path / "run") / repaired_manifest["data_script"]["path"]
+    )
+    missing_data.unlink()
+    dependency_repaired = build_companion(
+        BuildOptions(
+            paper_id=bundle.paper_id,
+            project_dir=tmp_path / "run",
+            language_was_defaulted=True,
+            workers=12,
+            review_context_chars=1,
+        ),
+        source_loader=source_loader,
+        llm=fake,
+        compiler=compiler,
+        pdf_validator=lambda path: {},
+    )
+    assert dependency_repaired["ok"], dependency_repaired
+    assert missing_data.is_file()
+    assert len(fake.calls) == call_count
+
     stale_preview_state = json.loads(state_path.read_text(encoding="utf-8"))
     stale_preview_state.pop("first_wave_preview_version")
     state_path.write_text(json.dumps(stale_preview_state), encoding="utf-8")

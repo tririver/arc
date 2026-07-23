@@ -187,17 +187,29 @@ def test_incremental_reader_failure_preserves_last_published_state(
         web_render_version="accepted-version",
     )
     prior = json.loads(state_path.read_text(encoding="utf-8"))
-    fake_web = SimpleNamespace(
-        publish_reader=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("render failed")),
+    fake_coordinator = SimpleNamespace(
+        request=lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("render failed")
+        ),
     )
-    monkeypatch.setitem(sys.modules, "arc_companion.web", fake_web)
+    monkeypatch.setattr(
+        pipeline, "_create_reader_coordinator",
+        lambda *_args, **_kwargs: fake_coordinator,
+    )
 
     result = pipeline._publish_reader_update(
         project, state_path, threading.RLock(),
     )
 
     assert result is None
-    assert json.loads(state_path.read_text(encoding="utf-8")) == prior
+    after = json.loads(state_path.read_text(encoding="utf-8"))
+    assert after["output_html"] == prior["output_html"]
+    assert after["output_html_sha256"] == prior["output_html_sha256"]
+    assert after["web_render_version"] == prior["web_render_version"]
+    assert after["reader_dirty"] is True
+    assert after["reader_publish_state_version"] == (
+        "arc.companion.reader-publish-state.v1"
+    )
 
 
 def test_chaptered_skip_translation_omits_lane_artifacts_and_migration(

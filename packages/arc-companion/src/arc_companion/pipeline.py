@@ -19,6 +19,7 @@ import stat
 import threading
 import unicodedata
 import uuid
+import weakref
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
@@ -70,6 +71,7 @@ from .ledger_registry import (
     registered_lane_ledger_paths,
 )
 from .progress import CompanionProgress
+from .reader_publish import ReaderPublishCoordinator
 from .source_credit import (
     normalize_source_credit,
     source_credit_visible_projection,
@@ -1467,7 +1469,7 @@ def _build_companion_unlocked(
                 for key, value in run_pdf.items()
             ) and delivery_was_valid
             web_repaired = False
-            if not _web_outputs_match(resumed_state):
+            if not _web_outputs_match(project_dir, resumed_state):
                 # The reviewed reader checkpoint is authoritative.  Rebuilding a
                 # missing web bundle must never cause completed model work to run.
                 if content_for_repair is None:
@@ -1724,16 +1726,9 @@ def _build_companion_unlocked(
         accepted_annotations: dict[str, dict[str, Any]] = {}
         accepted_reader_lock = threading.RLock()
 
-        def publish_accepted_reader(
-            lane: str, segment_id: str, value: dict[str, Any],
-        ) -> None:
+        def accepted_reader_overrides() -> dict[str, Any]:
             with accepted_reader_lock:
-                target = (
-                    accepted_translations if lane == "translation"
-                    else accepted_annotations
-                )
-                target[str(segment_id)] = dict(value)
-                overrides = {
+                return {
                     "document": bundle.document,
                     "source_credit": source_credit,
                     "chapters": [],
@@ -1750,12 +1745,24 @@ def _build_companion_unlocked(
                     "source_language": options.source_language,
                     "title_translations": title_translations,
                     "translation_mode": (
-                        "skipped" if options.skip_translation else "enabled"
+                        "skipped"
+                        if options.skip_translation
+                        else "enabled"
                     ),
                 }
+
+        def publish_accepted_reader(
+            lane: str, segment_id: str, value: dict[str, Any],
+        ) -> None:
+            with accepted_reader_lock:
+                target = (
+                    accepted_translations if lane == "translation"
+                    else accepted_annotations
+                )
+                target[str(segment_id)] = dict(value)
             _publish_reader_update(
                 project_dir, state_path, reader_publish_lock,
-                final_overrides=overrides,
+                final_overrides=accepted_reader_overrides,
             )
 
         _state(
@@ -2683,6 +2690,14 @@ def _build_chaptered_companion(
                 ),
             }
 
+    def request_chapter_reader_update() -> dict[str, Any] | None:
+        return _publish_reader_update(
+            options.project_dir.resolve(),
+            state_path,
+            reader_publish_lock,
+            final_overrides=chapter_reader_overrides,
+        )
+
     def segment_glossary_for(segment: dict[str, Any]) -> dict[str, Any]:
         if options.skip_translation:
             return {}
@@ -2961,7 +2976,7 @@ def _build_chaptered_companion(
             )
             _publish_reader_update(
                 options.project_dir.resolve(), state_path, reader_publish_lock,
-                final_overrides=chapter_reader_overrides(),
+                final_overrides=chapter_reader_overrides,
             )
         translation_candidates = (
             {}
@@ -3051,6 +3066,7 @@ def _build_chaptered_companion(
             )
             with reader_data_lock:
                 reader_guides[chapter_id] = dict(guide)
+            request_chapter_reader_update()
             return guide
         guide_input_hash = lane_semantic_sha256("guide", {
             "chapter_source": {
@@ -3150,6 +3166,7 @@ def _build_chaptered_companion(
                     )
                     with reader_data_lock:
                         reader_guides[chapter_id] = dict(guide)
+                    request_chapter_reader_update()
                     return guide
                 raise RuntimeError(
                     "accepted guide checkpoint is missing or fails local validation"
@@ -3192,6 +3209,7 @@ def _build_chaptered_companion(
                     )
                     with reader_data_lock:
                         reader_guides[chapter_id] = dict(guide)
+                    request_chapter_reader_update()
                     return guide
         guide_receipt: dict[str, Any] = {}
         guide_provider_receipt: dict[str, Any] = {}
@@ -3587,6 +3605,7 @@ def _build_chaptered_companion(
                     )
         with reader_data_lock:
             reader_guides[chapter_id] = dict(guide)
+        request_chapter_reader_update()
         return guide
 
     ledger_paths: dict[tuple[str, str], Path] = {}
@@ -3873,7 +3892,7 @@ def _build_chaptered_companion(
                 target[segment_id] = dict(value)
             _publish_reader_update(
                 options.project_dir.resolve(), state_path, reader_publish_lock,
-                final_overrides=chapter_reader_overrides(),
+                final_overrides=chapter_reader_overrides,
             )
             return value
         newly_accepted = block_state != "accepted"
@@ -5200,7 +5219,7 @@ def _build_chaptered_companion(
             target[str(segment_id)] = dict(value)
         _publish_reader_update(
             options.project_dir.resolve(), state_path, reader_publish_lock,
-            final_overrides=chapter_reader_overrides(),
+            final_overrides=chapter_reader_overrides,
         )
         return value
 
@@ -19564,7 +19583,9 @@ def _completion_outputs_match(state: dict[str, Any]) -> bool:
     return True
 
 
-def _web_outputs_match(state: dict[str, Any]) -> bool:
+def _web_outputs_match(
+    project_dir: Path, state: dict[str, Any],
+) -> bool:
     published = state.get("published")
     published_web = (
         published.get("web")
@@ -19578,24 +19599,25 @@ def _web_outputs_match(state: dict[str, Any]) -> bool:
         ),
     }
     try:
-        from .web import WEB_RENDER_VERSION
-    except ImportError:
+        from .web import (
+            WEB_RENDER_VERSION,
+            inspect_reader_publish,
+        )
+        actual = inspect_reader_publish(project_dir)
+    except (ImportError, OSError, ValueError, RuntimeError):
+        return False
+    if actual is None:
         return False
     if effective.get("web_render_version") != WEB_RENDER_VERSION:
         return False
-    for path_key, hash_key in (
-        ("output_html", "output_html_sha256"),
-        ("reader_snapshot_path", "reader_snapshot_sha256"),
-        ("web_manifest_path", "web_manifest_sha256"),
-    ):
-        path_value = effective.get(path_key)
-        expected = str(effective.get(hash_key) or "")
-        if not path_value or not expected:
+    for key, value in actual.items():
+        if effective.get(key) != value:
             return False
-        path = Path(str(path_value))
-        if not path.is_file() or path.stat().st_size == 0 or sha256_file(path) != expected:
-            return False
-    return True
+    return (
+        effective.get("reader_publish_state_version")
+        == "arc.companion.reader-publish-state.v1"
+        and effective.get("reader_dirty") is False
+    )
 
 
 def _first_wave_preview_outputs_match(state: dict[str, Any]) -> bool:
@@ -22650,7 +22672,9 @@ def _refresh_completed_source_credit_only(
         # A generic legacy/tampered PDF upgrade belongs to the central
         # render-only completion path, not this source-credit special case.
         return None
-    render_stale = not _web_outputs_match(dict(previous_state))
+    render_stale = not _web_outputs_match(
+        options.project_dir.resolve(), dict(previous_state),
+    )
     if old_credit_hash == canonical["canonical_sha256"] and not render_stale:
         if previous_state.get("build_request_sha256") == build_request_sha256:
             return None
@@ -23048,33 +23072,102 @@ def _store_reviewed_content(
     )
 
 
+_READER_COORDINATORS: weakref.WeakKeyDictionary[
+    Any, tuple[Path, Path, ReaderPublishCoordinator]
+] = weakref.WeakKeyDictionary()
+_READER_COORDINATOR_CACHE_LOCK = threading.RLock()
+
+
+def _reader_coordinator(
+    project_dir: Path,
+    state_path: Path,
+    lock: threading.RLock,
+) -> ReaderPublishCoordinator:
+    with _READER_COORDINATOR_CACHE_LOCK, lock:
+        cached = _READER_COORDINATORS.get(lock)
+        resolved_project = project_dir.resolve()
+        resolved_state = state_path.resolve()
+        if (
+            cached is not None
+            and cached[0] == resolved_project
+            and cached[1] == resolved_state
+        ):
+            return cached[2]
+        coordinator = _create_reader_coordinator(
+            project_dir, state_path, lock,
+        )
+        _READER_COORDINATORS[lock] = (
+            resolved_project, resolved_state, coordinator,
+        )
+        return coordinator
+
+
+def _create_reader_coordinator(
+    project_dir: Path,
+    state_path: Path,
+    lock: threading.RLock,
+) -> ReaderPublishCoordinator:
+    from .web import (
+        create_reader_publish_coordinator,
+    )
+    return create_reader_publish_coordinator(
+        project_dir,
+        state_loader=lambda: _read_optional_json(state_path),
+        state_merger=lambda values: _state(state_path, **dict(values)),
+        lock=lock,
+    )
+
+
 def _publish_reader_update(
     project_dir: Path,
     state_path: Path,
     lock: threading.RLock,
     *,
-    final_overrides: dict[str, Any] | None = None,
+    final_overrides: (
+        Mapping[str, Any]
+        | Callable[[], Mapping[str, Any] | None]
+        | None
+    ) = None,
     strict: bool = False,
+    final: bool = False,
 ) -> dict[str, Any] | None:
-    """Serialize reader publication and preserve the last atomic bundle on failure."""
+    """Mark a durable Reader boundary and request the latest accepted view."""
     try:
-        from .web import publish_reader
-    except ImportError:
+        with lock:
+            # The accepted business artifact is already durable at every call
+            # site.  Persist dirtiness before fallible inspection/preparation
+            # while sharing the publication lock, so a late acceptance cannot
+            # be overwritten by the prior publication's clean merge.
+            _state(
+                state_path,
+                reader_publish_state_version=(
+                    "arc.companion.reader-publish-state.v1"
+                ),
+                reader_dirty=True,
+            )
+            coordinator = _reader_coordinator(
+                project_dir, state_path, lock,
+            )
+
+            def latest() -> Mapping[str, Any] | None:
+                if callable(final_overrides):
+                    return final_overrides()
+                return final_overrides
+
+            result = coordinator.request(
+                latest,
+                final=final or strict,
+                strict=strict,
+            )
+    except Exception:
+        with _READER_COORDINATOR_CACHE_LOCK:
+            _READER_COORDINATORS.pop(lock, None)
         if strict:
             raise
         return None
-    with lock:
-        try:
-            published = publish_reader(
-                project_dir,
-                state=_read_optional_json(state_path),
-                final_overrides=final_overrides,
-            )
-        except Exception:
-            if strict:
-                raise
-            return None
-        return _state(state_path, **dict(published))
+    if result.status == "failed":
+        return None
+    return dict(result.state)
 
 
 def _state(path: Path, **values: Any) -> dict[str, Any]:
@@ -23202,6 +23295,10 @@ def _fingerprint_bound_state_key(key: str) -> bool:
         "web_render_version",
         "reader_snapshot_path",
         "reader_snapshot_sha256",
+        "reader_publish_state_version",
+        "reader_dirty",
+        "reader_committed_semantic_sha256",
+        "reader_committed_at",
         "web_manifest_path",
         "web_manifest_sha256",
         "web",

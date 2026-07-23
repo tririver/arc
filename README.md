@@ -396,9 +396,12 @@ place. Unanchored metadata falls back after the title in author, affiliation,
 profile order. Reference evidence is strict cache-only and cannot fetch,
 upgrade caches, invoke an LLM, or alter an affiliation or profile.
 
-During generation, each accepted segment atomically refreshes the static reader
-snapshot and its hashed HTML/JavaScript asset bundle. The last complete bundle
-remains readable if a later refresh fails. `arc-companion render-web` rebuilds
+During generation, each accepted Reader-visible boundary is marked dirty
+immediately. One per-build coordinator coalesces non-final updates into exact
+60-second monotonic windows; completion bypasses the wait but still deduplicates
+identical visible content. Content-addressed snapshot and asset objects are
+validated before `reader/index.html` is switched last, so the last complete
+bundle remains readable if a later refresh fails. `arc-companion render-web` rebuilds
 the reader manually from durable project checkpoints without repeating LLM
 work. The reader has no server dependency and vendors KaTeX, fonts, style,
 script, and media assets locally, so opening the completed HTML does not require

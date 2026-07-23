@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable
 import uuid
@@ -74,7 +75,9 @@ def render_content(
     except BuildInProgressError as exc:
         lock.release()
         return err("render_in_progress", str(exc), mode=RENDER_MODE, provider_calls=0)
-    web_commit: tuple[Path, bytes | None] | None = None
+    web_commit: tuple[Path, bytes | None, str] | None = None
+    reader_state_before: bytes | None = None
+    reader_state_owned: bytes | None = None
     state_committed = False
     try:
         state = _state(root)
@@ -220,26 +223,87 @@ def render_content(
                 })
         if format in {"web", "all"}:
             phase = time.monotonic()
-            from .web import publish_reader
+            from .web import (
+                create_reader_publish_coordinator,
+                publish_reader,
+            )
 
             index_path = root / "reader" / "index.html"
             previous_index = index_path.read_bytes() if index_path.is_file() else None
             overrides = {"status": "complete", **content}
-            web = publish_reader(
-                root,
-                state={
-                    "schema_version": "arc.companion.state.v3",
-                    "status": "complete",
-                    "paper_id": state.get("paper_id"),
-                    "translation_mode": content["translation_mode"],
-                    "annotation_language": content["language"],
-                    "source_language": content.get("source_language") or "und",
-                    "updated_at": state.get("updated_at"),
-                },
-                final_overrides=overrides,
-            )
+            state_path = root / "state.json"
+            reader_state_before = state_path.read_bytes()
+
+            def load_state() -> dict[str, Any]:
+                return _state(root)
+
+            def merge_state(values: dict[str, Any]) -> dict[str, Any]:
+                nonlocal reader_state_owned
+                latest = {**load_state(), **values}
+                latest["schema_version"] = "arc.companion.state.v3"
+                write_json(state_path, latest)
+                reader_state_owned = state_path.read_bytes()
+                return latest
+
+            def publish_for_render(candidate: Any) -> dict[str, Any]:
+                nonlocal web_commit
+                result = publish_reader(
+                    root,
+                    final_overrides=overrides,
+                    prepared=candidate,
+                )
+                # The publisher returns only after its index switch and
+                # committed validation succeeded.  This is the exact combined
+                # render rollback boundary; semantic no-ops never set it.
+                web_commit = (
+                    index_path,
+                    previous_index,
+                    candidate.index.sha256,
+                )
+                return result
+
+            reader_lock = threading.RLock()
+            with reader_lock:
+                merge_state({
+                    "reader_publish_state_version": (
+                        "arc.companion.reader-publish-state.v1"
+                    ),
+                    "reader_dirty": True,
+                })
+                coordinator = create_reader_publish_coordinator(
+                    root,
+                    state_loader=load_state,
+                    state_merger=merge_state,
+                    prepare_state={
+                        "status": "complete",
+                        "translation_mode": content["translation_mode"],
+                        "annotation_language": content["language"],
+                        "source_language": (
+                            content.get("source_language") or "und"
+                        ),
+                    },
+                    lock=reader_lock,
+                    prepared_publisher=publish_for_render,
+                )
+                reader_result = coordinator.request(
+                    lambda: overrides, final=True, strict=True,
+                )
+            web = {
+                key: value for key, value in reader_result.state.items()
+                if key in {
+                    "output_html",
+                    "output_html_sha256",
+                    "reader_snapshot_path",
+                    "reader_snapshot_sha256",
+                    "web_manifest_path",
+                    "web_manifest_sha256",
+                    "web_render_version",
+                    "source_credit_sha256",
+                    "source_credit_observation_sha256",
+                    "web",
+                }
+            }
             web["content_sha256"] = digest
-            web_commit = (index_path, previous_index)
             published["web"] = web
             phase_times["web"] = time.monotonic() - phase
         if format == "all":
@@ -296,9 +360,26 @@ def render_content(
         return ok(data)
     except BaseException as exc:
         rollback_error: Exception | None = None
-        if web_commit is not None and not state_committed:
+        if not state_committed and (
+            web_commit is not None or reader_state_before is not None
+        ):
             try:
-                _restore_web_index(*web_commit)
+                from .web import _reader_commit_lock
+
+                with _reader_commit_lock(root):
+                    if web_commit is not None:
+                        _restore_web_index(*web_commit)
+                    state_path = root / "state.json"
+                    if (
+                        reader_state_before is not None
+                        and reader_state_owned is not None
+                        and state_path.is_file()
+                        and state_path.read_bytes() == reader_state_owned
+                    ):
+                        write_text(
+                            state_path,
+                            reader_state_before.decode("utf-8"),
+                        )
             except Exception as restore_exc:  # pragma: no cover - filesystem failure
                 rollback_error = restore_exc
         if not isinstance(exc, Exception):
@@ -714,9 +795,18 @@ def _is_render_error(error: Any) -> bool:
     ))
 
 
-def _restore_web_index(path: Path, previous: bytes | None) -> None:
+def _restore_web_index(
+    path: Path,
+    previous: bytes | None,
+    switched_sha256: str,
+) -> None:
     """Restore the sole mutable web entry point after a later commit failure."""
 
+    if (
+        not path.is_file()
+        or sha256_file(path) != switched_sha256
+    ):
+        return
     if previous is None:
         path.unlink(missing_ok=True)
         return

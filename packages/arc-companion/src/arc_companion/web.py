@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from importlib import resources
@@ -9,12 +10,24 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
+import threading
+import time
 from typing import Any
 import unicodedata
 from urllib.parse import urlparse
+import weakref
 
 from .io import canonical_json, read_json, sha256_file, sha256_json, write_json, write_text
+from .reader_publish import (
+    PreparedReaderCandidate,
+    ReaderObject,
+    ReaderPublishCoordinator,
+    READER_PUBLISH_INTERVAL_SECONDS,
+    READER_PUBLISH_STATE_VERSION,
+    parse_reader_commit_utc,
+)
 from .reader_text import clean_reader_annotation, clean_reader_translation
 from .source import asset_path, block_id
 from .source_credit import (
@@ -64,6 +77,27 @@ _SVG_BLOCKED_ELEMENTS = "script|foreignObject|object|embed|iframe|style"
 
 class WebReaderError(RuntimeError):
     """The project cannot be safely represented as a companion reader."""
+
+
+class ReaderDependencyMissing(WebReaderError):
+    """A committed manifest dependency is missing but the pointer is intact."""
+
+
+_READER_COMMIT_LOCKS_GUARD = threading.Lock()
+_READER_COMMIT_LOCKS: weakref.WeakValueDictionary[
+    Path, threading.RLock
+] = weakref.WeakValueDictionary()
+
+
+@dataclass(frozen=True)
+class PreparedWebReaderPublish:
+    """One immutable Reader candidate shared by digest and publisher."""
+
+    root: Path
+    semantic: PreparedReaderCandidate
+    objects: tuple[ReaderObject, ...]
+    index: ReaderObject
+    outputs: Mapping[str, Any]
 
 
 def build_reader_snapshot(
@@ -314,7 +348,9 @@ def build_reader_snapshot(
         "schema_version": READER_SNAPSHOT_VERSION,
         "web_render_version": WEB_RENDER_VERSION,
         "status": str(overrides.get("status") or current_state.get("status") or "preparing"),
-        "updated_at": str(current_state.get("updated_at") or ""),
+        # Publication timing belongs to state/manifest, not Reader-visible
+        # snapshot bytes.  Keeping it out makes semantic no-op repair exact.
+        "updated_at": "",
         "paper_id": str(current_state.get("paper_id") or ""),
         "title": title,
         "source_title": source_title,
@@ -372,18 +408,30 @@ def publish_reader(
     snapshot: Mapping[str, Any] | None = None,
     state: Mapping[str, Any] | None = None,
     final_overrides: Mapping[str, Any] | None = None,
+    prepared: PreparedWebReaderPublish | None = None,
 ) -> dict[str, Any]:
-    """Atomically publish a static ``file://`` reader, replacing index last.
+    """Prepare and atomically publish one exact static Reader candidate."""
+    candidate = prepared or prepare_reader_publish(
+        project_dir, snapshot=snapshot, state=state,
+        final_overrides=final_overrides,
+    )
+    if candidate.root != Path(project_dir).resolve():
+        raise WebReaderError("prepared Reader candidate belongs to another project")
+    return publish_prepared_reader(candidate)
 
-    Every candidate file except ``index.html`` is immutable/content-addressed.
-    The complete candidate is validated before the index commit, and a failed
-    post-commit validation restores the previous index bytes.
-    """
+
+def prepare_reader_publish(
+    project_dir: Path,
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+    state: Mapping[str, Any] | None = None,
+    final_overrides: Mapping[str, Any] | None = None,
+    created_at: datetime | None = None,
+) -> PreparedWebReaderPublish:
+    """Build fixed candidate bytes and semantic records without writing."""
     root = Path(project_dir).resolve()
     current_state = _state(root, state)
     checkpoint = _checkpoint(root, current_state)
-    # Keep the publish entrypoint safe even when a caller supplies a snapshot
-    # built earlier while the workflow was still in preview state.
     _reader_final_overrides(checkpoint)
     _require_final_reader_payload(
         current_state,
@@ -400,36 +448,29 @@ def publish_reader(
     if value.get("schema_version") != READER_SNAPSHOT_VERSION:
         raise WebReaderError("reader snapshot has an unsupported schema")
 
-    reader_dir = root / "reader"
-    data_dir = reader_dir / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    (reader_dir / "assets").mkdir(parents=True, exist_ok=True)
-    index_path = reader_dir / "index.html"
-    previous_index = index_path.read_bytes() if index_path.is_file() else None
-
-    builtin_assets, builtin_root = _publish_builtin_assets(reader_dir)
-    source_assets = _publish_source_assets(
+    builtin_objects, builtin_root = _prepare_builtin_assets()
+    source_objects = _prepare_source_assets(
         root,
         current_state,
         value,
         final_overrides=final_overrides,
     )
-    value["revision"] = sha256_json({key: item for key, item in value.items() if key != "revision"})
+    value["revision"] = sha256_json(
+        {key: item for key, item in value.items() if key != "revision"}
+    )
 
     snapshot_bytes = _json_file_bytes(value)
     snapshot_hash = hashlib.sha256(snapshot_bytes).hexdigest()
-    snapshot_path = data_dir / f"snapshot-{snapshot_hash}.json"
-    _publish_fault_point("snapshot")
-    write_json(snapshot_path, value)
-    _assert_file_identity(snapshot_path, sha256=snapshot_hash, size=len(snapshot_bytes))
+    snapshot_relative = f"reader/data/snapshot-{snapshot_hash}.json"
+    snapshot_object = ReaderObject(
+        snapshot_relative, snapshot_bytes, "snapshot",
+    )
     data_text = "window.__ARC_COMPANION_SNAPSHOT__ = " + _safe_script_json(value) + ";\n"
-    data_hash = hashlib.sha256(data_text.encode("utf-8")).hexdigest()
+    data_bytes = data_text.encode("utf-8")
+    data_hash = hashlib.sha256(data_bytes).hexdigest()
     data_name = f"snapshot-{data_hash}.js"
-    data_path = data_dir / data_name
-    _publish_fault_point("data-script")
-    write_text(data_path, data_text)
-    _assert_file_identity(
-        data_path, sha256=data_hash, size=len(data_text.encode("utf-8"))
+    data_object = ReaderObject(
+        f"reader/data/{data_name}", data_bytes, "data-script",
     )
 
     index_text = _index_html(
@@ -438,19 +479,28 @@ def publish_reader(
         title=str(value.get("title") or "Companion Reader"),
         language=str(value.get("language") or "und"),
     )
-    index_hash = hashlib.sha256(index_text.encode("utf-8")).hexdigest()
+    index_bytes = index_text.encode("utf-8")
+    index_object = ReaderObject("reader/index.html", index_bytes, "index")
+    semantic = PreparedReaderCandidate(
+        snapshot=value,
+        web_render_version=WEB_RENDER_VERSION,
+        builtin_objects=tuple(builtin_objects),
+        source_objects=tuple(source_objects),
+    )
     manifest = {
         "schema_version": WEB_MANIFEST_VERSION,
         "web_render_version": WEB_RENDER_VERSION,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "snapshot": _file_record(snapshot_path, root=root),
-        "data_script": _file_record(data_path, root=root),
-        "index": {
-            "path": index_path.relative_to(root).as_posix(),
-            "sha256": index_hash,
-            "bytes": len(index_text.encode("utf-8")),
-        },
-        "assets": [*builtin_assets, *source_assets],
+        "reader_semantic_sha256": semantic.semantic_sha256,
+        "created_at": _aware_utc(
+            created_at or datetime.now(timezone.utc)
+        ).isoformat(),
+        "snapshot": _object_record(snapshot_object),
+        "data_script": _object_record(data_object),
+        "index": _object_record(index_object),
+        "assets": [
+            *(_object_record(item) for item in builtin_objects),
+            *(_object_record(item) for item in source_objects),
+        ],
         "coverage": deepcopy(value.get("coverage") or {}),
         "source_credit": _source_credit_manifest(value),
         **(
@@ -460,45 +510,104 @@ def publish_reader(
     }
     manifest_bytes = _json_file_bytes(manifest)
     manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
-    manifest_path = data_dir / f"manifest-{manifest_hash}.json"
-    _publish_fault_point("manifest")
-    write_json(manifest_path, manifest)
-    _assert_file_identity(
-        manifest_path, sha256=manifest_hash, size=len(manifest_bytes)
+    manifest_object = ReaderObject(
+        f"reader/data/manifest-{manifest_hash}.json",
+        manifest_bytes,
+        "manifest",
+    )
+    outputs = {
+        "output_html": str(root / index_object.relative_path),
+        "output_html_sha256": index_object.sha256,
+        "reader_snapshot_path": str(root / snapshot_object.relative_path),
+        "reader_snapshot_sha256": snapshot_object.sha256,
+        "web_manifest_path": str(root / manifest_object.relative_path),
+        "web_manifest_sha256": manifest_object.sha256,
+        "web_render_version": WEB_RENDER_VERSION,
+        "source_credit_sha256": value["source_credit_sha256"],
+        "source_credit_observation_sha256": sha256_json(
+            value["source_credit_visible_projection"]
+        ),
+    }
+    return PreparedWebReaderPublish(
+        root=root,
+        semantic=semantic,
+        objects=(
+            *builtin_objects,
+            *source_objects,
+            snapshot_object,
+            data_object,
+            manifest_object,
+        ),
+        index=index_object,
+        outputs=outputs,
     )
 
-    # Validate the exact on-disk candidate plus the in-memory index before the
-    # only mutable path is touched.
-    disk_manifest = _read_object(manifest_path, label="candidate web manifest")
+
+def publish_prepared_reader(
+    candidate: PreparedWebReaderPublish,
+) -> dict[str, Any]:
+    with _reader_commit_lock(candidate.root):
+        return _publish_prepared_reader_locked(candidate)
+
+
+def _publish_prepared_reader_locked(
+    candidate: PreparedWebReaderPublish,
+) -> dict[str, Any]:
+    """Publish immutable objects, validate, then switch the sole mutable index."""
+    root = candidate.root
+    index_path = root / candidate.index.relative_path
+    previous_index: bytes | None = None
+    if index_path.exists() or index_path.is_symlink():
+        # The old pointer is authoritative for adoption.  Never overwrite an
+        # invalid or unexplained pointer.
+        try:
+            inspect_reader_publish(root)
+        except ReaderDependencyMissing:
+            if index_path.is_symlink() or not index_path.is_file():
+                raise
+            previous_index = index_path.read_bytes()
+            if previous_index != candidate.index.data:
+                raise
+        else:
+            previous_index = index_path.read_bytes()
+
+    for item in candidate.objects:
+        label = item.kind
+        if item.kind == "builtin-asset":
+            marker = item.relative_path.split("/builtin-", 1)[-1]
+            label = "builtin-asset:" + marker.split("/", 1)[-1]
+        elif item.kind == "source-asset":
+            label = "source-asset:" + Path(item.relative_path).name
+        _publish_fault_point(label)
+        _create_or_adopt_immutable(
+            root, root / item.relative_path, item.data,
+        )
+
+    manifest_path = Path(str(candidate.outputs["web_manifest_path"]))
+    snapshot_path = Path(str(candidate.outputs["reader_snapshot_path"]))
+    disk_manifest = _read_object(
+        manifest_path, label="candidate web manifest",
+    )
     _validate_reader_bundle(
         root,
         index_path=index_path,
         snapshot_path=snapshot_path,
         manifest=disk_manifest,
-        index_text=index_text,
+        index_text=candidate.index.data.decode("utf-8"),
     )
 
-    # Publishing index last is the commit point: an open reader sees either the
-    # previous complete bundle or this complete bundle, never half an update.
     published_state = {
-            **current_state,
-            "output_html": str(index_path),
-            "output_html_sha256": index_hash,
-            "reader_snapshot_path": str(snapshot_path),
-            "reader_snapshot_sha256": snapshot_hash,
-            "web_manifest_path": str(manifest_path),
-            "web_manifest_sha256": manifest_hash,
-            "web_render_version": WEB_RENDER_VERSION,
+        **dict(candidate.outputs),
     }
     index_commit_attempted = False
     try:
         _publish_fault_point("index")
         index_commit_attempted = True
-        write_text(index_path, index_text)
+        write_text(index_path, candidate.index.data.decode("utf-8"))
         _assert_file_identity(
             index_path,
-            sha256=index_hash,
-            size=len(index_text.encode("utf-8")),
+            sha256=candidate.index.sha256,
+            size=len(candidate.index.data),
         )
         _publish_fault_point("post-index-validation")
         report = validate_reader_project(root, state=published_state)
@@ -507,19 +616,182 @@ def publish_reader(
             _restore_index(index_path, previous_index)
         raise
     return {
-        "output_html": str(index_path),
-        "output_html_sha256": index_hash,
-        "reader_snapshot_path": str(snapshot_path),
-        "reader_snapshot_sha256": snapshot_hash,
-        "web_manifest_path": str(manifest_path),
-        "web_manifest_sha256": manifest_hash,
-        "web_render_version": WEB_RENDER_VERSION,
-        "source_credit_sha256": value["source_credit_sha256"],
-        "source_credit_observation_sha256": sha256_json(
-            value["source_credit_visible_projection"]
-        ),
+        **dict(candidate.outputs),
         "web": report,
     }
+
+
+def _reader_commit_lock(root: Path) -> threading.RLock:
+    resolved = root.resolve()
+    with _READER_COMMIT_LOCKS_GUARD:
+        return _READER_COMMIT_LOCKS.setdefault(
+            resolved, threading.RLock(),
+        )
+
+
+def inspect_reader_publish(project_dir: Path) -> dict[str, Any] | None:
+    """Validate and describe the bundle committed by the actual index."""
+    root = Path(project_dir).resolve()
+    index_path = root / "reader" / "index.html"
+    if not index_path.exists() and not index_path.is_symlink():
+        return None
+    if index_path.is_symlink() or not index_path.is_file():
+        raise WebReaderError("committed reader index is not a regular file")
+    manifest_path = _discover_manifest_for_index(root, index_path)
+    manifest = _read_object(manifest_path, label="committed web manifest")
+    snapshot_record = manifest.get("snapshot")
+    if not isinstance(snapshot_record, Mapping):
+        raise WebReaderError("web manifest snapshot record is invalid")
+    snapshot_path = _inside(root, Path(str(snapshot_record.get("path") or "")))
+    if not snapshot_path.exists():
+        raise ReaderDependencyMissing(
+            f"web manifest file is missing: {snapshot_record.get('path')}"
+        )
+    index_text = index_path.read_text(encoding="utf-8")
+    snapshot, _ = _validate_reader_bundle(
+        root,
+        index_path=index_path,
+        snapshot_path=snapshot_path,
+        manifest=manifest,
+        index_text=index_text,
+    )
+    builtin: list[ReaderObject] = []
+    sources: list[ReaderObject] = []
+    for record in manifest.get("assets") or []:
+        if not isinstance(record, Mapping):
+            continue
+        relative = str(record.get("path") or "")
+        kind = (
+            "builtin-asset"
+            if "/builtin-" in relative
+            else "source-asset"
+        )
+        item = ReaderObject(
+            relative,
+            _inside(root, Path(relative)).read_bytes(),
+            kind,
+        )
+        (builtin if kind == "builtin-asset" else sources).append(item)
+    semantic = PreparedReaderCandidate(
+        snapshot=snapshot,
+        web_render_version=str(manifest.get("web_render_version") or ""),
+        builtin_objects=tuple(builtin),
+        source_objects=tuple(sources),
+    ).semantic_sha256
+    declared_semantic = str(
+        manifest.get("reader_semantic_sha256") or ""
+    )
+    if declared_semantic and declared_semantic != semantic:
+        raise WebReaderError(
+            "web manifest Reader semantic digest is invalid"
+        )
+    return {
+        "output_html": str(index_path),
+        "output_html_sha256": sha256_file(index_path),
+        "reader_snapshot_path": str(snapshot_path),
+        "reader_snapshot_sha256": sha256_file(snapshot_path),
+        "web_manifest_path": str(manifest_path),
+        "web_manifest_sha256": sha256_file(manifest_path),
+        "web_render_version": str(manifest.get("web_render_version") or ""),
+        "source_credit_sha256": snapshot["source_credit_sha256"],
+        "source_credit_observation_sha256": sha256_json(
+            snapshot["source_credit_visible_projection"]
+        ),
+        "reader_committed_semantic_sha256": semantic,
+    }
+
+
+def create_reader_publish_coordinator(
+    project_dir: Path,
+    *,
+    state_loader: Any,
+    state_merger: Any,
+    utc_now: Any = lambda: datetime.now(timezone.utc),
+    monotonic: Any = time.monotonic,
+    interval_seconds: float = READER_PUBLISH_INTERVAL_SECONDS,
+    lock: threading.RLock | None = None,
+    prepared_publisher: Any = None,
+    prepare_state: Mapping[str, Any] | None = None,
+) -> ReaderPublishCoordinator:
+    """Inspect/adopt the actual index and create one injectable coordinator."""
+    root = Path(project_dir).resolve()
+    state = dict(state_loader())
+    try:
+        inspected = inspect_reader_publish(root)
+    except ReaderDependencyMissing:
+        # A matching prepared index may repair missing immutable dependencies;
+        # publish_prepared_reader still refuses an unexplained pointer.
+        inspected = None
+    if inspected is None:
+        state = dict(state_merger({
+            "reader_publish_state_version": READER_PUBLISH_STATE_VERSION,
+            "reader_dirty": True,
+            "reader_committed_semantic_sha256": "",
+            "reader_committed_at": "",
+        }))
+    else:
+        repairs = {
+            key: value
+            for key, value in inspected.items()
+            if state.get(key) != value
+        }
+        if (
+            state.get("reader_publish_state_version")
+            != READER_PUBLISH_STATE_VERSION
+        ):
+            repairs["reader_publish_state_version"] = (
+                READER_PUBLISH_STATE_VERSION
+            )
+        if (
+            repairs
+            or parse_reader_commit_utc(
+                state.get("reader_committed_at")
+            ) is None
+        ):
+            repairs["reader_committed_at"] = _aware_utc(
+                utc_now()
+            ).isoformat()
+        if repairs:
+            state = dict(state_merger(repairs))
+
+    def prepare(
+        overrides: Mapping[str, Any] | None,
+    ) -> PreparedReaderCandidate:
+        web_candidate = prepare_reader_publish(
+            root,
+            state={**dict(state_loader()), **dict(prepare_state or {})},
+            final_overrides=overrides,
+            created_at=_aware_utc(utc_now()),
+        )
+        semantic = web_candidate.semantic
+        return PreparedReaderCandidate(
+            snapshot=semantic.snapshot,
+            web_render_version=semantic.web_render_version,
+            builtin_objects=semantic.builtin_objects,
+            source_objects=semantic.source_objects,
+            payload=web_candidate,
+        )
+
+    def publish(candidate: PreparedReaderCandidate) -> Mapping[str, Any]:
+        if not isinstance(candidate.payload, PreparedWebReaderPublish):
+            raise RuntimeError(
+                "Reader coordinator lost its prepared candidate"
+            )
+        active_publisher = (
+            prepared_publisher or publish_prepared_reader
+        )
+        return active_publisher(candidate.payload)
+
+    return ReaderPublishCoordinator(
+        state_loader=state_loader,
+        state_merger=state_merger,
+        preparer=prepare,
+        publisher=publish,
+        utc_now=utc_now,
+        monotonic=monotonic,
+        interval_seconds=interval_seconds,
+        lock=lock,
+    )
 
 
 def validate_reader_project(
@@ -667,6 +939,7 @@ def _validate_reader_bundle(
         raise WebReaderError("web manifest assets must be an array")
     for record in (manifest.get("snapshot"), manifest.get("data_script"), *assets):
         _validate_file_record(root, record)
+    _validate_source_asset_bindings(root, snapshot, assets)
     _validate_memory_file_record(
         root,
         manifest.get("index"),
@@ -715,6 +988,64 @@ def _validate_reader_bundle(
         raise WebReaderError("reader chapter content differs from declared segment coverage")
     _validate_snapshot_terms(snapshot)
     return snapshot, segment_ids
+
+
+def _validate_source_asset_bindings(
+    root: Path,
+    snapshot: Mapping[str, Any],
+    manifest_assets: Sequence[Any],
+) -> None:
+    expected: dict[str, str] = {}
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            url = value.get("url")
+            digest = value.get("sha256")
+            if (
+                isinstance(url, str)
+                and url.startswith("assets/source/")
+                and isinstance(digest, str)
+            ):
+                relative = f"reader/{url}"
+                existing = expected.get(relative)
+                if existing is not None and existing != digest:
+                    raise WebReaderError(
+                        "reader snapshot source asset hashes conflict"
+                    )
+                expected[relative] = digest
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(snapshot)
+    actual: dict[str, str] = {}
+    for record in manifest_assets:
+        if not isinstance(record, Mapping):
+            continue
+        relative = str(record.get("path") or "")
+        if not relative.startswith("reader/assets/source/"):
+            continue
+        if relative in actual:
+            raise WebReaderError(
+                "web manifest repeats a source asset record"
+            )
+        actual[relative] = str(record.get("sha256") or "")
+    if actual != expected:
+        raise WebReaderError(
+            "reader snapshot and manifest source assets differ"
+        )
+    for relative, digest in expected.items():
+        path = root / relative
+        _reject_symlink_components(root, path)
+        if (
+            not stat.S_ISREG(path.lstat().st_mode)
+            or sha256_file(path) != digest
+        ):
+            raise WebReaderError(
+                "reader source asset binding is invalid"
+            )
 
 
 def _source_credit_manifest(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -823,18 +1154,32 @@ def _walk_term_runs(value: Any):
 
 def _discover_manifest_for_index(root: Path, index_path: Path) -> Path:
     """Find the immutable manifest whose index record matches the commit."""
-    if not index_path.is_file():
+    _reject_symlink_components(root, index_path)
+    try:
+        index_mode = index_path.lstat().st_mode
+    except FileNotFoundError:
         raise WebReaderError(f"reader artifact is missing or empty: {index_path}")
+    if not stat.S_ISREG(index_mode):
+        raise WebReaderError("committed reader index is not a regular file")
     index_hash = sha256_file(index_path)
     index_size = index_path.stat().st_size
     legacy = root / "reader" / "manifest.json"
-    candidates = ([legacy] if legacy.is_file() else []) + sorted(
-        (root / "reader" / "data").glob("manifest-*.json"),
-        key=lambda path: path.stat().st_mtime_ns,
-        reverse=True,
+    data_dir = root / "reader" / "data"
+    _reject_symlink_components(root, legacy)
+    _reject_symlink_components(root, data_dir)
+    candidates = ([legacy] if legacy.is_file() else []) + (
+        sorted(
+            data_dir.glob("manifest-*.json"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        if data_dir.is_dir() else []
     )
     expected_path = index_path.relative_to(root).as_posix()
     for candidate in candidates:
+        _reject_symlink_components(root, candidate)
+        if not stat.S_ISREG(candidate.lstat().st_mode):
+            continue
         try:
             value = _read_object(candidate, label="web manifest candidate")
         except WebReaderError:
@@ -884,8 +1229,30 @@ def _json_file_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _object_record(value: ReaderObject) -> dict[str, Any]:
+    return {
+        "path": value.relative_path,
+        "sha256": value.sha256,
+        "bytes": len(value.data),
+    }
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise WebReaderError("reader publish UTC clock must be aware")
+    return value.astimezone(timezone.utc)
+
+
 def _assert_file_identity(path: Path, *, sha256: str, size: int) -> None:
-    if not path.is_file() or path.stat().st_size != size or sha256_file(path) != sha256:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as exc:
+        raise WebReaderError(f"candidate reader file is missing: {path}") from exc
+    if (
+        not stat.S_ISREG(mode)
+        or path.stat().st_size != size
+        or sha256_file(path) != sha256
+    ):
         raise WebReaderError(f"candidate reader write changed unexpectedly: {path}")
 
 
@@ -898,6 +1265,109 @@ def _restore_index(index_path: Path, previous: bytes | None) -> None:
         index_path.unlink(missing_ok=True)
         return
     _atomic_write_bytes(index_path, previous)
+
+
+def _create_or_adopt_immutable(
+    root: Path, path: Path, value: bytes,
+) -> None:
+    """Install one complete immutable target or adopt an exact winner."""
+    _ensure_regular_directory_chain(root, path.parent)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.candidate-", dir=path.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            _adopt_exact_regular(path, value)
+        else:
+            _adopt_exact_regular(path, value)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        raise
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _adopt_exact_regular(path: Path, value: bytes) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise WebReaderError(
+            f"immutable Reader target cannot be adopted: {path}"
+        ) from exc
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_size != len(value):
+            raise WebReaderError(
+                f"immutable Reader target conflicts: {path}"
+            )
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if digest.hexdigest() != hashlib.sha256(value).hexdigest():
+            raise WebReaderError(
+                f"immutable Reader target conflicts: {path}"
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_regular_directory_chain(root: Path, parent: Path) -> None:
+    try:
+        relative = parent.relative_to(root)
+    except ValueError as exc:
+        raise WebReaderError("Reader target escapes the project") from exc
+    current = root
+    for component in relative.parts:
+        current = current / component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            try:
+                current.mkdir()
+            except FileExistsError:
+                pass
+            mode = current.lstat().st_mode
+        if not stat.S_ISDIR(mode):
+            raise WebReaderError(
+                f"Reader target parent is not a regular directory: {current}"
+            )
+
+
+def _reject_symlink_components(root: Path, path: Path) -> None:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise WebReaderError("Reader path escapes the project") from exc
+    current = root
+    for component in relative.parts:
+        current = current / component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(mode):
+            raise WebReaderError(
+                f"Reader path contains a symbolic link: {current}"
+            )
 
 
 def _state(root: Path, supplied: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -1878,7 +2348,7 @@ def _safe_sources(value: Any) -> list[dict[str, str]]:
     return output[:3]
 
 
-def _publish_builtin_assets(reader_dir: Path) -> tuple[list[dict[str, Any]], str]:
+def _prepare_builtin_assets() -> tuple[tuple[ReaderObject, ...], str]:
     package_root = resources.files("arc_companion").joinpath("web_assets")
     payloads: list[tuple[Path, bytes]] = []
     digest = hashlib.sha256()
@@ -1890,14 +2360,15 @@ def _publish_builtin_assets(reader_dir: Path) -> tuple[list[dict[str, Any]], str
         digest.update(b"\0")
         digest.update(hashlib.sha256(data).digest())
     asset_root = f"assets/builtin-{digest.hexdigest()}"
-    output: list[dict[str, Any]] = []
-    for relative, data in payloads:
-        destination = reader_dir / asset_root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _publish_fault_point(f"builtin-asset:{relative.as_posix()}")
-        _write_bytes(destination, data)
-        output.append(_file_record(destination, root=reader_dir.parent))
-    return sorted(output, key=lambda record: str(record["path"])), asset_root
+    output = tuple(
+        ReaderObject(
+            f"reader/{asset_root}/{relative.as_posix()}",
+            data,
+            "builtin-asset",
+        )
+        for relative, data in payloads
+    )
+    return output, asset_root
 
 
 def _resource_files(root: Any, prefix: Path = Path()) -> list[tuple[Path, Any]]:
@@ -1912,13 +2383,13 @@ def _resource_files(root: Any, prefix: Path = Path()) -> list[tuple[Path, Any]]:
     return output
 
 
-def _publish_source_assets(
+def _prepare_source_assets(
     root: Path,
     state: Mapping[str, Any],
     snapshot: dict[str, Any],
     *,
     final_overrides: Mapping[str, Any] | None,
-) -> list[dict[str, Any]]:
+) -> tuple[ReaderObject, ...]:
     checkpoint = _checkpoint(root, state)
     overrides = _deep_merge(_reader_final_overrides(checkpoint), final_overrides or {})
     envelope = _document_envelope(checkpoint, overrides)
@@ -1928,7 +2399,8 @@ def _publish_source_assets(
         for item in document.get("assets") or []
         if isinstance(item, Mapping) and (item.get("asset_id") or item.get("id"))
     }
-    records: list[dict[str, Any]] = []
+    objects: list[ReaderObject] = []
+    object_paths: set[str] = set()
     by_id: dict[str, dict[str, str]] = {}
     source_groups = [
         segment.get("source") or []
@@ -1948,7 +2420,8 @@ def _publish_source_assets(
                 path = asset_path(asset or {}) if asset else None
                 if path is None or not path.is_file() or path.suffix.casefold() not in _WEB_IMAGE_SUFFIXES:
                     continue
-                source_digest = sha256_file(path)
+                raw_data = path.read_bytes()
+                source_digest = hashlib.sha256(raw_data).hexdigest()
                 expected = str(asset.get("sha256") or "")
                 if expected and expected != source_digest:
                     raise WebReaderError(f"source asset hash mismatch: {path}")
@@ -1956,24 +2429,27 @@ def _publish_source_assets(
                 if cached is None:
                     suffix = path.suffix.casefold()
                     if suffix == ".svg":
-                        data = _safe_svg(path.read_text(encoding="utf-8", errors="replace")).encode("utf-8")
+                        data = _safe_svg(
+                            raw_data.decode("utf-8", errors="replace")
+                        ).encode("utf-8")
                     else:
-                        data = path.read_bytes()
+                        data = raw_data
                     digest = hashlib.sha256(data).hexdigest()
-                    destination = root / "reader" / "assets" / "source" / f"{digest}{suffix}"
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    _publish_fault_point(f"source-asset:{digest}{suffix}")
-                    _write_bytes(destination, data)
+                    relative = f"reader/assets/source/{digest}{suffix}"
                     cached = {
-                        "url": destination.relative_to(root / "reader").as_posix(),
-                        "sha256": sha256_file(destination),
+                        "url": Path(relative).relative_to("reader").as_posix(),
+                        "sha256": digest,
                     }
                     by_id[str(identifier)] = cached
-                    records.append(_file_record(destination, root=root))
+                    if relative not in object_paths:
+                        objects.append(
+                            ReaderObject(relative, data, "source-asset")
+                        )
+                        object_paths.add(relative)
                 rendered.append(dict(cached))
             if rendered:
                 source["assets"] = rendered
-    return sorted(records, key=lambda record: str(record["path"]))
+    return tuple(sorted(objects, key=lambda item: item.relative_path))
 
 
 def _index_html(
@@ -2222,9 +2698,17 @@ def _validate_file_record(root: Path, value: Any) -> None:
     relative = Path(str(value.get("path") or ""))
     if relative.is_absolute() or ".." in relative.parts:
         raise WebReaderError("web manifest contains an unsafe path")
+    unresolved = root / relative
+    _reject_symlink_components(root, unresolved)
+    try:
+        mode = unresolved.lstat().st_mode
+    except FileNotFoundError:
+        raise ReaderDependencyMissing(
+            f"web manifest file is missing: {relative}"
+        )
+    if not stat.S_ISREG(mode):
+        raise WebReaderError(f"web manifest file is not regular: {relative}")
     path = _inside(root, relative)
-    if not path.is_file():
-        raise WebReaderError(f"web manifest file is missing: {relative}")
     if sha256_file(path) != str(value.get("sha256") or ""):
         raise WebReaderError(f"web manifest hash mismatch: {relative}")
     if path.stat().st_size != int(value.get("bytes") or -1):

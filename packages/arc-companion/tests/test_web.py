@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 from copy import deepcopy
 
 import pytest
@@ -22,9 +24,14 @@ from arc_companion.web import (
     WebReaderError,
     _source_credit_visible_projection,
     build_reader_snapshot,
+    create_reader_publish_coordinator,
+    inspect_reader_publish,
+    prepare_reader_publish,
+    publish_prepared_reader,
     publish_reader,
     validate_reader_project,
 )
+from arc_companion.reader_publish import READER_PUBLISH_STATE_VERSION
 from arc_companion.source_credit import (
     normalize_source_credit,
     source_credit_placement,
@@ -591,6 +598,378 @@ def test_publish_is_static_local_content_addressed_and_index_last(
     assert validate_reader_project(project, state={
         **read_json(project / "state.json"), **result,
     })["ok"] is True
+
+
+def test_prepare_reader_publish_is_zero_write_and_candidate_is_fixed(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    before = {
+        path.relative_to(project): (path.stat().st_mtime_ns, path.read_bytes())
+        for path in project.rglob("*")
+        if path.is_file()
+    }
+
+    candidate = prepare_reader_publish(
+        project,
+        created_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+
+    after = {
+        path.relative_to(project): (path.stat().st_mtime_ns, path.read_bytes())
+        for path in project.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert candidate.semantic.semantic_sha256
+    assert all(item.data for item in candidate.objects)
+
+
+def test_immutable_targets_adopt_exact_bytes_and_reject_conflicts(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    candidate = prepare_reader_publish(project)
+    first = publish_prepared_reader(candidate)
+    immutable = Path(first["reader_snapshot_path"])
+    before_mtime = immutable.stat().st_mtime_ns
+
+    publish_prepared_reader(candidate)
+    assert immutable.stat().st_mtime_ns == before_mtime
+
+    other_project, _checkpoint, _segment_id = _project(
+        tmp_path / "other",
+    )
+    conflicting = prepare_reader_publish(other_project)
+    target = other_project / conflicting.objects[0].relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"conflict")
+    with pytest.raises(WebReaderError, match="conflicts"):
+        publish_prepared_reader(conflicting)
+    assert not (other_project / "reader" / "index.html").exists()
+
+
+def test_publish_rejects_symlink_target_and_parent(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    candidate = prepare_reader_publish(project)
+    target = project / candidate.objects[0].relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.write_bytes(candidate.objects[0].data)
+    target.symlink_to(outside)
+    with pytest.raises(WebReaderError, match="cannot be adopted"):
+        publish_prepared_reader(candidate)
+
+    other, _checkpoint, _segment_id = _project(tmp_path / "parent")
+    parent_candidate = prepare_reader_publish(other)
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (other / "reader").symlink_to(outside_dir, target_is_directory=True)
+    with pytest.raises(WebReaderError, match="regular directory"):
+        publish_prepared_reader(parent_candidate)
+
+
+def test_inspector_recomputes_semantic_instead_of_trusting_manifest(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    published = publish_reader(project)
+    manifest_path = Path(published["web_manifest_path"])
+    manifest = read_json(manifest_path)
+    manifest["reader_semantic_sha256"] = "0" * 64
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(WebReaderError, match="semantic digest"):
+        inspect_reader_publish(project)
+
+
+def test_snapshot_source_assets_must_match_manifest_all_and_only(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    snapshot = build_reader_snapshot(project)
+    snapshot["appendices"] = [
+        {
+            "source": [
+                {
+                    "assets": [
+                        {
+                            "url": "assets/source/missing.png",
+                            "sha256": "0" * 64,
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+    snapshot["revision"] = sha256_json({
+        key: value for key, value in snapshot.items()
+        if key != "revision"
+    })
+
+    with pytest.raises(
+        WebReaderError,
+        match="snapshot and manifest source assets differ",
+    ):
+        publish_reader(project, snapshot=snapshot)
+    assert not (project / "reader" / "index.html").exists()
+
+
+def test_coordinator_adopts_index_before_state_without_web_rewrite(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    published = publish_reader(project)
+    files = [
+        path for path in (project / "reader").rglob("*") if path.is_file()
+    ]
+    before = {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in files}
+    state: dict[str, object] = {}
+    reconciled = datetime(2026, 7, 23, 4, tzinfo=timezone.utc)
+
+    def merge(values):
+        state.update(values)
+        return dict(state)
+
+    create_reader_publish_coordinator(
+        project,
+        state_loader=lambda: dict(state),
+        state_merger=merge,
+        utc_now=lambda: reconciled,
+        monotonic=lambda: 10.0,
+    )
+
+    assert state["reader_publish_state_version"] == READER_PUBLISH_STATE_VERSION
+    assert state["reader_committed_at"] == reconciled.isoformat()
+    assert state["web_manifest_path"] == published["web_manifest_path"]
+    assert state["reader_committed_semantic_sha256"]
+    assert {
+        path: (path.stat().st_mtime_ns, path.read_bytes()) for path in files
+    } == before
+
+
+def test_adoption_repairs_reconcile_utc_but_exact_startup_preserves_it(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    publish_reader(project)
+    actual = inspect_reader_publish(project)
+    assert actual is not None
+    old = datetime(2026, 7, 22, tzinfo=timezone.utc).isoformat()
+    state: dict[str, object] = {
+        **actual,
+        "reader_publish_state_version": READER_PUBLISH_STATE_VERSION,
+        "reader_dirty": False,
+        "reader_committed_at": old,
+        "web_manifest_path": "stale",
+    }
+
+    def merge(values):
+        state.update(values)
+        return dict(state)
+
+    now = datetime(2026, 7, 23, tzinfo=timezone.utc)
+    create_reader_publish_coordinator(
+        project,
+        state_loader=lambda: dict(state),
+        state_merger=merge,
+        utc_now=lambda: now,
+        monotonic=lambda: 1.0,
+    )
+    assert state["reader_committed_at"] == now.isoformat()
+
+    state["reader_committed_at"] = old
+    create_reader_publish_coordinator(
+        project,
+        state_loader=lambda: dict(state),
+        state_merger=merge,
+        utc_now=lambda: now,
+        monotonic=lambda: 1.0,
+    )
+    assert state["reader_committed_at"] == old
+
+
+def test_same_candidate_publish_race_adopts_exact_targets(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    candidate = prepare_reader_publish(project)
+    barrier = threading.Barrier(2)
+    results: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=2)
+            results.append(publish_prepared_reader(candidate))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert len(results) == 2
+    assert inspect_reader_publish(project) is not None
+
+
+def test_concurrent_failed_publish_cannot_rollback_successful_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arc_companion.web as web_module
+
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    candidate = prepare_reader_publish(project)
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def fault(label: str) -> None:
+        if (
+            threading.current_thread().name == "failing-publisher"
+            and label == "post-index-validation"
+        ):
+            raise RuntimeError("injected post-index failure")
+
+    monkeypatch.setattr(web_module, "_publish_fault_point", fault)
+
+    def worker() -> None:
+        barrier.wait(timeout=2)
+        try:
+            publish_prepared_reader(candidate)
+        except RuntimeError:
+            outcomes.append("failed")
+        else:
+            outcomes.append("published")
+
+    threads = [
+        threading.Thread(target=worker, name="failing-publisher"),
+        threading.Thread(target=worker, name="successful-publisher"),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert sorted(outcomes) == ["failed", "published"]
+    assert inspect_reader_publish(project) is not None
+
+
+def test_current_bundle_without_semantic_field_is_adopted_without_rewrite(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    published = publish_reader(project)
+    old_manifest = Path(published["web_manifest_path"])
+    manifest = read_json(old_manifest)
+    manifest.pop("reader_semantic_sha256")
+    manifest_bytes = (
+        json.dumps(
+            manifest, ensure_ascii=False, indent=2, sort_keys=True,
+            default=str,
+        )
+        + "\n"
+    ).encode()
+    legacy_path = old_manifest.with_name(
+        f"manifest-{hashlib.sha256(manifest_bytes).hexdigest()}.json"
+    )
+    legacy_path.write_bytes(manifest_bytes)
+    old_manifest.unlink()
+    files = [
+        path for path in (project / "reader").rglob("*") if path.is_file()
+    ]
+    before = {path: path.stat().st_mtime_ns for path in files}
+    state: dict[str, object] = {}
+
+    def merge(values):
+        state.update(values)
+        return dict(state)
+
+    create_reader_publish_coordinator(
+        project,
+        state_loader=lambda: dict(state),
+        state_merger=merge,
+        utc_now=lambda: datetime(2026, 7, 23, tzinfo=timezone.utc),
+        monotonic=lambda: 1.0,
+    )
+
+    assert state["reader_committed_semantic_sha256"]
+    assert {path: path.stat().st_mtime_ns for path in files} == before
+
+
+def test_post_index_state_failure_retries_by_adoption_without_web_rewrite(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    state: dict[str, object] = dict(read_json(project / "state.json"))
+
+    def failing_merge(values):
+        if values.get("reader_committed_semantic_sha256"):
+            raise RuntimeError("state merge failed")
+        state.update(values)
+        return dict(state)
+
+    coordinator = create_reader_publish_coordinator(
+        project,
+        state_loader=lambda: dict(state),
+        state_merger=failing_merge,
+        utc_now=lambda: datetime(2026, 7, 23, tzinfo=timezone.utc),
+        monotonic=lambda: 1.0,
+    )
+    with pytest.raises(RuntimeError, match="state merge failed"):
+        coordinator.request(lambda: None, final=True, strict=True)
+    index = project / "reader" / "index.html"
+    assert index.is_file()
+    before = {
+        path: (path.stat().st_mtime_ns, path.read_bytes())
+        for path in (project / "reader").rglob("*")
+        if path.is_file()
+    }
+
+    def merge(values):
+        state.update(values)
+        return dict(state)
+
+    retry = create_reader_publish_coordinator(
+        project,
+        state_loader=lambda: dict(state),
+        state_merger=merge,
+        utc_now=lambda: datetime(2026, 7, 23, 0, 1, tzinfo=timezone.utc),
+        monotonic=lambda: 2.0,
+    )
+    result = retry.request(lambda: None, final=True, strict=True)
+
+    assert result.status == "deduplicated"
+    assert {
+        path: (path.stat().st_mtime_ns, path.read_bytes())
+        for path in (project / "reader").rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_coordinator_rejects_unexplained_regular_index(
+    tmp_path: Path,
+) -> None:
+    project, _checkpoint, _segment_id = _project(tmp_path)
+    index = project / "reader" / "index.html"
+    index.parent.mkdir(parents=True)
+    index.write_text("unexplained", encoding="utf-8")
+    state: dict[str, object] = {}
+
+    with pytest.raises(
+        WebReaderError,
+        match="no web manifest matches",
+    ):
+        create_reader_publish_coordinator(
+            project,
+            state_loader=lambda: dict(state),
+            state_merger=lambda values: dict(values),
+        )
+    assert index.read_text(encoding="utf-8") == "unexplained"
 
 
 def test_web_snapshot_and_manifest_bind_shared_source_credit_and_reject_tamper(

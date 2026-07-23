@@ -31,6 +31,23 @@ the Reader, while `--format web` is independent of PDF reuse. The completed
 pipeline applies the same matcher, so an exact complete project needs no model,
 TeX compiler, or Poppler call.
 
+## Reader publication
+
+Accepted Reader-visible changes are marked dirty immediately and coalesced by
+one coordinator per build. Non-final publication occurs at most once per
+60-second monotonic window; final and first-chapter completion bypass the wait
+but still use semantic deduplication. The semantic identity covers the visible
+snapshot, web render version, bundled Reader bytes, and the sorted source-asset
+records while excluding only operational timestamps and machine-local paths.
+
+Preparation performs no writes. Publication installs exact content-addressed
+objects, validates the complete candidate, and switches `reader/index.html`
+last as the sole mutable commit pointer. Restart inspection treats the actual
+index as authoritative, validates its manifest, snapshot, data script,
+coverage, and every asset, and can adopt or repair state without model or PDF
+work. Exact semantic reuse does not rewrite web files or advance the committed
+UTC timestamp.
+
 ## Legacy receipts and render-only upgrades
 
 A pre-T17 receipt or a receipt without the current schema is classified as

@@ -675,14 +675,19 @@ def test_keyboard_interrupt_after_web_publish_rolls_back_then_propagates(
     import arc_companion.web as web_module
 
     project, digest = _project(tmp_path)
-    index = project / "reader" / "index.html"
-    index.parent.mkdir(parents=True, exist_ok=True)
-    index.write_bytes(b"last-good-reader")
+    committed_content = load_reader_content(project, digest)["content"]
+    initial = web_module.publish_reader(
+        project,
+        state=read_json(project / "state.json"),
+        final_overrides={"status": "complete", **committed_content},
+    )
+    index = Path(initial["output_html"])
+    last_good_reader = index.read_bytes()
     before_state = (project / "state.json").read_bytes()
 
     def publish_reader(root: Path, **_kwargs) -> dict[str, str]:
         html = root / "reader" / "index.html"
-        html.write_bytes(b"new-reader")
+        html.write_bytes(_kwargs["prepared"].index.data)
         return {
             "output_html": str(html),
             "output_html_sha256": sha256_file(html),
@@ -697,8 +702,45 @@ def test_keyboard_interrupt_after_web_publish_rolls_back_then_propagates(
     with pytest.raises(KeyboardInterrupt):
         render_content(project, format="web", content_sha256=digest)
 
-    assert index.read_bytes() == b"last-good-reader"
+    assert index.read_bytes() == last_good_reader
     assert (project / "state.json").read_bytes() == before_state
+
+
+def test_render_failure_does_not_rollback_newer_reader_commit(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import arc_companion.render as render_module
+    import arc_companion.web as web_module
+
+    project, digest = _project(tmp_path)
+    index = project / "reader" / "index.html"
+
+    def publish_reader(root: Path, **kwargs) -> dict[str, str]:
+        html = root / "reader" / "index.html"
+        html.parent.mkdir(parents=True, exist_ok=True)
+        html.write_bytes(kwargs["prepared"].index.data)
+        return {
+            "output_html": str(html),
+            "output_html_sha256": sha256_file(html),
+        }
+
+    def concurrent_commit(*_args, **_kwargs):
+        index.write_bytes(b"newer-reader")
+        state = read_json(project / "state.json")
+        state["concurrent_reader_commit"] = True
+        write_json(project / "state.json", state)
+        raise RuntimeError("later state failure")
+
+    monkeypatch.setattr(web_module, "publish_reader", publish_reader)
+    monkeypatch.setattr(render_module, "_publish_state", concurrent_commit)
+
+    result = render_content(project, format="web", content_sha256=digest)
+
+    assert result["ok"] is False
+    assert index.read_bytes() == b"newer-reader"
+    assert read_json(project / "state.json")[
+        "concurrent_reader_commit"
+    ] is True
 
 
 def test_render_failure_preserves_last_good_state_and_pdf(tmp_path: Path) -> None:
