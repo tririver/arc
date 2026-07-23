@@ -27,8 +27,10 @@ from arc_companion.pdf import (
     PDF_RENDER_VERSION,
     PDF_VALIDATOR_VERSION,
     build_pdf_validation_receipt,
+    match_validated_pdf_revision,
     pdf_render_recipe_sha256,
 )
+from arc_companion.package import package_project
 from arc_companion.render import render_content
 from arc_companion.run_lock import ProjectBuildLock
 
@@ -89,6 +91,125 @@ def _render_fakes(monkeypatch, *, fail_validation: bool = False) -> None:
         (_ for _ in ()).throw(RuntimeError("validator failed"))
         if fail_validation else {"pages": 1}
     ))
+
+
+def test_render_materializes_manifest_assets_in_immutable_pdf_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arc_companion.render as render_module
+
+    project, _old_digest = _project(tmp_path)
+    image = project / "fixture-source.jpg"
+    image.write_bytes(b"offline fixture jpeg bytes")
+    content = _content()
+    content["document"]["blocks"].append({
+        "block_id": "fig-1",
+        "kind": "figure",
+        "figure_id": "figure-1",
+    })
+    content["document"]["figures"].append({
+        "id": "figure-1",
+        "asset_id": "asset-1",
+        "caption": "Fixture figure",
+    })
+    content["document"]["assets"].append({
+        "id": "asset-1",
+        "cache_path": str(image),
+        "sha256": sha256_file(image),
+        "media_type": "image/jpeg",
+    })
+    content["segments"][0]["block_ids"].append("fig-1")
+    content["translations"]["s1"]["blocks"].append({
+        "block_id": "fig-1",
+        "text": "",
+        "translate": False,
+    })
+    stored = store_reader_content(project, content=content)
+    digest = str(stored["content_sha256"])
+    reviewed = load_reader_content(project, digest)["content"]
+    state = read_json(project / "state.json")
+    state["published"]["content_sha256"] = digest
+    state["published"]["content_object_path"] = str(stored["path"])
+    write_json(project / "state.json", state)
+
+    def validator(path: Path) -> dict[str, object]:
+        return {
+            "validator": PDF_VALIDATOR_VERSION,
+            "result": "success",
+            "pages": 1,
+            "pages_checked": 1,
+            "dpi": 144,
+            "pdf_bytes": path.stat().st_size,
+            "text_bytes": 1,
+            "raster_bytes": 1,
+            "encrypted": False,
+            "embedded_font_count": 2,
+            "font_roles": {
+                "sans": ["Noto Sans"],
+                "serif": ["Latin Modern"],
+            },
+        }
+
+    credit_observation = {
+        "schema_version": "arc.companion.source-credit-pdf-observation.v1",
+        "canonical_sha256": reviewed["source_credit_sha256"],
+        "searchable_text_sha256": "a" * 64,
+        "ordered_ids": [],
+        "visible_projection_sha256": "b" * 64,
+        "visible_counts": {
+            "authors": 0,
+            "affiliations": 0,
+            "profiles": 0,
+        },
+    }
+    monkeypatch.setattr(render_module, "validate_pdf", validator)
+    monkeypatch.setattr(
+        render_module,
+        "validate_pdf_source_credit_text",
+        lambda *_args, **_kwargs: credit_observation,
+    )
+
+    def compiler(tex: Path, pdf: Path) -> None:
+        assets = list((tex.parent / "assets").glob("*.jpg"))
+        assert len(assets) == 1
+        assert assets[0].read_bytes() == image.read_bytes()
+        assert f"assets/{assets[0].name}" in tex.read_text(encoding="utf-8")
+        pdf.write_bytes(b"%PDF offline fixture")
+
+    result = render_content(
+        project,
+        format="pdf",
+        content_sha256=digest,
+        compiler=compiler,
+        pdf_validator=validator,
+    )
+
+    assert result["ok"] is True, result
+    current = read_json(project / "state.json")
+    pdf_state = current["published"]["pdf"]
+    render_dir = Path(pdf_state["output_pdf"]).parent
+    manifest = read_json(Path(pdf_state["source_manifest_path"]))
+    assert len(manifest["assets"]) == 1
+    materialized = Path(manifest["assets"][0]["output_path"])
+    assert materialized.parent == render_dir / "assets"
+    assert materialized.read_bytes() == image.read_bytes()
+    assert manifest["assets"][0]["output_sha256"] == sha256_file(materialized)
+    validation = read_json(Path(pdf_state["validation_path"]))
+    assert validation["source_manifest_sha256"] == (
+        pdf_state["source_manifest_sha256"]
+    )
+    assert pdf_state["source_manifest_sha256"] == sha256_file(
+        Path(pdf_state["source_manifest_path"])
+    )
+    assert match_validated_pdf_revision(
+        project, current, content_sha256=digest,
+    ).reusable
+
+    package = package_project(project)
+    assert package["ok"] is True, package
+    assert materialized.relative_to(project).as_posix() in {
+        item["path"] for item in package["data"]["files"]
+    }
 
 
 def test_reviewed_content_is_immutable_and_tampering_is_rejected(tmp_path: Path) -> None:

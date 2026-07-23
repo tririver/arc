@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import shutil
 import threading
 import time
 from typing import Any, Callable
@@ -475,22 +476,6 @@ def render_pdf_content_unlocked(
     pdf_validator: Callable[[Path], dict[str, object]],
 ) -> dict[str, Any]:
     """Render one verified content object without acquiring project locks."""
-    tex, source_manifest = render_companion_tex(
-        content["document"], content["segments"], content["annotations"],
-        output_dir=root, language=content["language"], metadata=content["metadata"],
-        translations=content["translations"], glossary=content["glossary"],
-        evidence_by_segment=content["reader_evidence_by_segment"],
-        augmentation_scope="substantive", chapters=content["chapters"],
-        chapter_guides=content["chapter_guides"],
-        source_language=content.get("source_language") or "und",
-        title_translations=content.get("title_translations"),
-        source_credit=content["source_credit"],
-        translation_reference=content.get("translation_reference"),
-        project_root=root,
-    )
-    fidelity_errors = validate_tex_fidelity(tex, content["document"], source_manifest)
-    if fidelity_errors:
-        raise LatexError("source fidelity validation failed: " + "; ".join(fidelity_errors))
     stem = f"{safe_name(str(state.get('paper_id') or 'paper'))}_companion_{safe_name(content['language'])}"
     directory_stem = safe_name(stem)[:48].strip("-_") or "companion"
     # Every successful render is published at a new immutable path.  Therefore
@@ -528,6 +513,38 @@ def render_pdf_content_unlocked(
         raise LatexError("could not allocate a fresh PDF render identity")
     render_dir = render_allocation.path
     render_identity_receipt = render_dir / ARTIFACT_ID_RECEIPT_NAME
+    try:
+        tex, source_manifest = render_companion_tex(
+            content["document"],
+            content["segments"],
+            content["annotations"],
+            output_dir=render_dir,
+            language=content["language"],
+            metadata=content["metadata"],
+            translations=content["translations"],
+            glossary=content["glossary"],
+            evidence_by_segment=content["reader_evidence_by_segment"],
+            augmentation_scope="substantive",
+            chapters=content["chapters"],
+            chapter_guides=content["chapter_guides"],
+            source_language=content.get("source_language") or "und",
+            title_translations=content.get("title_translations"),
+            source_credit=content["source_credit"],
+            translation_reference=content.get("translation_reference"),
+            project_root=root,
+        )
+        fidelity_errors = validate_tex_fidelity(
+            tex, content["document"], source_manifest,
+        )
+        if fidelity_errors:
+            raise LatexError(
+                "source fidelity validation failed: "
+                + "; ".join(fidelity_errors)
+            )
+    except BaseException:
+        if render_allocation.disposition == "created":
+            shutil.rmtree(render_dir, ignore_errors=True)
+        raise
     tex_path = render_dir / f"{stem}.tex"
     pdf_path = render_dir / f"{stem}.pdf"
     manifest_path = render_dir / "source-manifest.json"
@@ -646,11 +663,7 @@ def render_pdf_content_unlocked(
             ):
                 path.unlink(missing_ok=True)
             if render_allocation.disposition == "created":
-                render_identity_receipt.unlink(missing_ok=True)
-                try:
-                    render_dir.rmdir()
-                except OSError:
-                    pass
+                shutil.rmtree(render_dir, ignore_errors=True)
         raise
     return {
         "content_sha256": content_sha256,
