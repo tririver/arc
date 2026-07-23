@@ -509,6 +509,7 @@ def _add_web_reader(root: Path) -> dict[str, Path]:
         "source_credit": source_credit,
         "source_credit_sha256": source_credit["canonical_sha256"],
         "source_credit_order": [],
+        "source_credit_visible_projection": [],
         "source_credit_front_matter_block_ids": [],
         "source_credit_replaced_block_ids": [],
         "coverage": {
