@@ -10,8 +10,9 @@ import threading
 from pathlib import Path
 from typing import Any, Mapping
 
-from arc_llm.json_schema import CodexSchemaError, to_provider_json_schema, validate_codex_strict_schema
+from arc_llm.codex_binary import resolve_codex_binary
 from arc_llm.failure_classification import classify_provider_diagnostic, disposition_error_kwargs
+from arc_llm.json_schema import CodexSchemaError, to_provider_json_schema, validate_codex_strict_schema
 from arc_llm.paths import llm_tmp_root, schema_cache_root
 from arc_llm.schema_cache import canonical_json, sha256_text, write_schema_cache_file
 from arc_llm.response_candidates import has_complete_candidate, material_from_codex
@@ -59,7 +60,7 @@ def _require_codex_json_stream_support(env: Mapping[str, str]) -> None:
     if override is not None:
         supported = _env_bool(env, "ARC_CODEX_JSON_STREAM_SUPPORT", False)
     else:
-        key = (env.get("ARC_CODEX_BIN", "codex"), env.get("PATH"))
+        key = (_codex_binary(env), env.get("PATH"))
         with _JSON_STREAM_SUPPORT_LOCK:
             cached = _JSON_STREAM_SUPPORT_CACHE.get(key)
         if cached is None:
@@ -263,6 +264,10 @@ def _submitted_output_error(message: str) -> LLMWorkerError:
     )
 
 
+def _codex_binary(env: Mapping[str, str]) -> str:
+    return str(resolve_codex_binary(env))
+
+
 def _base_cmd(env: Mapping[str, str], *, stateful: bool = False) -> list[str]:
     profile = _env_text(env, "ARC_CODEX_PROFILE", "")
     profile_v2 = _env_text(env, "ARC_CODEX_PROFILE_V2", "")
@@ -271,7 +276,7 @@ def _base_cmd(env: Mapping[str, str], *, stateful: bool = False) -> list[str]:
     if enable_mcp and mcp_mode not in {"user-config", "arc-only"}:
         raise LLMWorkerError("ARC_CODEX_MCP_MODE must be one of: user-config, arc-only")
     cmd = [
-        "codex",
+        _codex_binary(env),
         "exec",
         "--skip-git-repo-check",
         "--color",
@@ -368,7 +373,7 @@ def _codex_resume_supports_output_schema(env: Mapping[str, str]) -> bool:
     override = env.get("ARC_CODEX_RESUME_SUPPORTS_OUTPUT_SCHEMA")
     if override is not None:
         return _env_bool(env, "ARC_CODEX_RESUME_SUPPORTS_OUTPUT_SCHEMA", False)
-    key = (env.get("ARC_CODEX_BIN", "codex"), env.get("PATH"))
+    key = (_codex_binary(env), env.get("PATH"))
     with _RESUME_SCHEMA_SUPPORT_LOCK:
         cached = _RESUME_SCHEMA_SUPPORT_CACHE.get(key)
         if cached is not None:
@@ -382,7 +387,7 @@ def _codex_resume_supports_output_schema(env: Mapping[str, str]) -> bool:
 def _probe_codex_resume_schema_support(env: Mapping[str, str]) -> bool:
     try:
         result = subprocess.run(
-            [env.get("ARC_CODEX_BIN", "codex"), "exec", "resume", "--help"],
+            [_codex_binary(env), "exec", "resume", "--help"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

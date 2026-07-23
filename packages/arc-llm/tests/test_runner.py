@@ -1207,7 +1207,7 @@ def test_call_record_v5_requires_warnings_and_existing_provider_emits_empty_list
 
     assert ARC_LLM_CALL_RECORD_SCHEMA_VERSION == "arc.llm.call_record.v5"
     assert "warnings" in ARC_LLM_CALL_RECORD_SCHEMA["required"]
-    assert record["warnings"] == []
+    assert record["warnings"] == ["nested_shell.helper_missing"]
 
 
 def test_kimi_config_warnings_propagate_to_call_record(monkeypatch):

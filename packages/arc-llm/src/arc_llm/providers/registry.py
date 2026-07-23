@@ -6,6 +6,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
+from arc_llm.nested_shell_capability import (
+    NESTED_SHELL_CAPABILITY_SCHEMA_VERSION,
+    NESTED_SHELL_PROBE_ID,
+    NestedShellCapability,
+    resolve_nested_shell_capability,
+)
+
 from .claude_cli import ClaudeCliProvider
 from .codex_cli import CodexCliProvider
 from .manual import ManualProvider
@@ -120,10 +127,28 @@ def provider_diagnostic(
     provider_id: str,
     env: Mapping[str, str] | None = None,
     cwd: Path | str | None = None,
+    *,
+    probe_nested_shell: bool = False,
 ) -> dict[str, Any]:
     spec = get_provider_spec(provider_id)
     result = spec.diagnostic_metadata()
     result["risks"] = _kimi_risk_paths(env=env, cwd=cwd) if provider_id == "kimi-code-cli" else []
+    capability = (
+        resolve_nested_shell_capability(
+            provider=provider_id, env=env, cwd=cwd
+        )
+        if probe_nested_shell
+        else NestedShellCapability(
+            schema_version=NESTED_SHELL_CAPABILITY_SCHEMA_VERSION,
+            provider=provider_id,
+            nested_sandboxed_shell=False,
+            status="not_requested",
+            probe_kind="none",
+            probe_identity=NESTED_SHELL_PROBE_ID,
+            warning="nested_shell.not_requested",
+        )
+    )
+    result["nested_shell_capability"] = capability.doctor_json()
     return result
 
 

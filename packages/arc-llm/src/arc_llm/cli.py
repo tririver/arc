@@ -176,7 +176,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
         if args.doctor_command == "provider":
             selected = select_llm_provider()
             result = {
-                **provider_diagnostic(selected.provider),
+                **provider_diagnostic(selected.provider, probe_nested_shell=True),
                 "host": selected.host.host,
                 "signals": selected.signals,
                 "llm_safety": safety,
@@ -186,7 +186,7 @@ def _dispatch(args: argparse.Namespace) -> Any:
             return result
         config = resolve_llm_config()
         result = {
-            **provider_diagnostic(config.provider),
+            **provider_diagnostic(config.provider, probe_nested_shell=True),
             "model": config.model,
             "host": config.host.host,
             "signals": config.signals,

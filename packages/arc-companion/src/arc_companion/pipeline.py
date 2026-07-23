@@ -2347,6 +2347,30 @@ def _build_chaptered_companion(
                     "idempotency_key": current_idempotency_key,
                     "artifact_dir": str(active_artifact_dir),
                 })
+                runtime_env = _llm_runtime_env(
+                    allow_internet=options.allow_internet,
+                    force_disable_internet=not options.allow_internet,
+                    inherit_host_tools=(
+                        options.inherit_host_tools
+                        if guide_policy is None else False
+                    ),
+                    paper_access_policy=guide_policy,
+                    serialize_paper_access_policy=not guide_structured_policy,
+                )
+                from arc_llm.runner import prepare_runtime_prompt
+
+                active_prompt, _guide_prefix, _guide_nested_shell = (
+                    prepare_runtime_prompt(
+                        active_prompt,
+                        provider=options.provider,
+                        model=options.model,
+                        model_tier=None if options.model else ANNOTATION_TIER,
+                        env=runtime_env,
+                        artifact_dir=active_artifact_dir,
+                        session_manager=session_manager,
+                        schema=active_schema,
+                    )
+                )
                 last_guide_submission_receipt = write_ledger_submission_receipt(
                     checkpoint_dir=checkpoint_dir,
                     artifact_dir=active_artifact_dir,
@@ -2377,16 +2401,7 @@ def _build_chaptered_companion(
                         active_prompt, schema=active_schema,
                         provider=options.provider, model=options.model,
                         model_tier=None if options.model else ANNOTATION_TIER,
-                        env=_llm_runtime_env(
-                            allow_internet=options.allow_internet,
-                            force_disable_internet=not options.allow_internet,
-                            inherit_host_tools=(
-                                options.inherit_host_tools
-                                if guide_policy is None else False
-                            ),
-                            paper_access_policy=guide_policy,
-                            serialize_paper_access_policy=not guide_structured_policy,
-                        ),
+                        env=runtime_env,
                         artifact_dir=active_artifact_dir, call_label=active_label,
                         idle_timeout_seconds=options.idle_timeout_seconds,
                         session_policy="stateful", session_manager=session_manager,
@@ -2736,12 +2751,10 @@ def _build_chaptered_companion(
                         **({
                             "reference_access": (
                                 "At bootstrap, read only reference_targets applicable to this lane. "
-                                "Use arc-paper-worker policy-targets for a non-inline catalog, then "
-                                "get-parsed-toc/get-parsed-section and artifact-read pagination when "
-                                "a sandboxed shell is available. Otherwise return "
-                                "arc_evidence_requests using list-reference-targets and the same "
-                                "read-only operations; never parse, refresh, fetch, or use an "
-                                "unauthorized source."
+                                "{{ARC_NESTED_SHELL_CAPABILITY}} Use list-reference-targets through "
+                                "the available access channel for a non-inline catalog, followed by "
+                                "get-parsed-toc/get-parsed-section and artifact-read pagination; "
+                                "never parse, refresh, fetch, or use an unauthorized source."
                             ),
                             "reference_authority": (
                                 "The original source is authoritative for facts, coverage, and structure. "
@@ -3459,6 +3472,35 @@ def _build_chaptered_companion(
                         suffix_offset = ordered_segment_ids.index(segment_id)
                     except ValueError:
                         suffix_offset = len(ordered_segment_ids)
+                    runtime_env = _llm_runtime_env(
+                        allow_internet=bool(runtime_profile["allow_internet"]),
+                        force_disable_internet=not bool(
+                            runtime_profile["allow_internet"]
+                        ),
+                        inherit_host_tools=(
+                            bool(runtime_profile["inherit_host_tools"])
+                            if lane_policy is None else False
+                        ),
+                        paper_access_policy=lane_policy,
+                        serialize_paper_access_policy=not lane_structured_policy,
+                    )
+                    from arc_llm.runner import prepare_runtime_prompt
+
+                    active_prompt, _lane_prefix, _lane_nested_shell = (
+                        prepare_runtime_prompt(
+                            active_prompt,
+                            provider=str(runtime_profile["provider"]),
+                            model=runtime_profile.get("model"),
+                            model_tier=(
+                                None if runtime_profile.get("model")
+                                else runtime_profile.get("model_tier")
+                            ),
+                            env=runtime_env,
+                            artifact_dir=active_artifact_dir,
+                            session_manager=session_manager,
+                            schema=active_schema,
+                        )
+                    )
                     current_submission_receipt = write_ledger_submission_receipt(
                         checkpoint_dir=checkpoint_dir,
                         artifact_dir=active_artifact_dir,
@@ -3496,18 +3538,7 @@ def _build_chaptered_companion(
                                 None if runtime_profile.get("model")
                                 else runtime_profile.get("model_tier")
                             ),
-                            env=_llm_runtime_env(
-                                allow_internet=bool(runtime_profile["allow_internet"]),
-                                force_disable_internet=not bool(
-                                    runtime_profile["allow_internet"]
-                                ),
-                                inherit_host_tools=(
-                                    bool(runtime_profile["inherit_host_tools"])
-                                    if lane_policy is None else False
-                                ),
-                                paper_access_policy=lane_policy,
-                                serialize_paper_access_policy=not lane_structured_policy,
-                            ),
+                            env=runtime_env,
                             artifact_dir=active_artifact_dir,
                             call_label=active_label,
                             idle_timeout_seconds=kwargs.get("idle_timeout_seconds"),
@@ -12719,6 +12750,18 @@ def _llm_call(
     )
     active_prompt = prompt
     active_schema = _intent_guidance_schema(schema, intent_guidance)
+    from arc_llm.runner import prepare_runtime_prompt
+
+    active_prompt, _unused_prefix, _nested_shell = prepare_runtime_prompt(
+        active_prompt,
+        provider=options.provider,
+        model=options.model,
+        model_tier=None if options.model else model_tier,
+        env=runtime_env,
+        artifact_dir=artifact_dir,
+        schema=active_schema,
+        stage_paper_worker=(getattr(llm, "__module__", "") == "arc_llm.runner"),
+    )
     control: dict[str, Any] | None = None
     if recovery_descriptor is not None and not bool(
         getattr(llm, "_arc_owns_recovery_receipt", False)
@@ -13256,13 +13299,16 @@ def _guided_prompt(
 ) -> str:
     if intent_guidance is None:
         return prompt
+    from arc_llm.nested_shell_capability import NESTED_SHELL_PROMPT_MARKER
+
     return (
         worker_guidance_prompt_prefix(intent_guidance, lane=lane)
-        + "\nIf this host has no sandboxed shell, request the same exact cached reads through "
-        "arc_evidence_requests. Use list-reference-targets to inspect a non-inline target "
-        "catalog, then get-parsed-toc or get-parsed-section with arguments source_id, "
-        "locator, and optional byte offset/limit; return [] when no controller read is "
-        "needed.\n"
+        + "\n"
+        + NESTED_SHELL_PROMPT_MARKER
+        + " Use list-reference-targets through the available access channel to inspect a "
+        "non-inline target catalog, then get-parsed-toc or get-parsed-section with "
+        "source_id, locator, and optional byte offset/limit; return [] when no Controller "
+        "read is needed.\n"
         + prompt
     )
 
@@ -13345,15 +13391,6 @@ def _llm_runtime_env(
         env["ARC_CLAUDE_BARE"] = "true"
         claude_tools = ["WebSearch", "WebFetch"] if allow_internet else []
         claude_allowed = list(claude_tools)
-        if paper_access_policy is not None and not disable_paper_cli:
-            claude_tools.insert(0, "Bash")
-            claude_allowed = [
-                "Bash(arc-paper-worker get-parsed-toc:*)",
-                "Bash(arc-paper-worker get-parsed-section:*)",
-                "Bash(arc-paper-worker policy-targets:*)",
-                "Bash(arc-paper-worker artifact-read:*)",
-                *claude_allowed,
-            ]
         env["ARC_CLAUDE_TOOLS"] = ",".join(claude_tools)
         env["ARC_CLAUDE_ALLOWED_TOOLS"] = ",".join(claude_allowed)
     return env

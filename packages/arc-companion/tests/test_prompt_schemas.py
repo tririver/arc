@@ -242,7 +242,9 @@ def test_generation_and_review_prompts_treat_explanation_as_reader_driven() -> N
     assert "equivalent formulation as an inconsistency" in generation
     assert "intermediate mathematics" in generation
     assert "materially useful current understanding or development" in generation
-    assert "host internet search and arc-paper-worker" in generation
+    assert "host internet search" in generation
+    assert "{{ARC_NESTED_SHELL_CAPABILITY}}" in generation
+    assert "arc-paper-worker" not in generation
     assert "search-results page" in generation
     assert "HTTP(S) URL" in generation
     assert "native session" in generation

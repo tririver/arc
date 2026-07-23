@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from arc_llm.call_record import strip_arc_llm_call_records
+from arc_llm.nested_shell_capability import NESTED_SHELL_PROMPT_MARKER
 from arc_llm.progress_prompt import ensure_runtime_progress_contract, runtime_progress_contract
 
 from .config import LoopConfig, WorkerConfig
@@ -57,6 +58,13 @@ def render_initial_worker_prompt(
         "### Task",
         rendered_template,
         "",
+        "## ARC Paper Access",
+        (
+            NESTED_SHELL_PROMPT_MARKER
+            if str(worker.runtime.get("arc_paper_cli_access", "full")) == "full"
+            else "Direct paper CLI access is disabled for this worker."
+        ),
+        "",
         "## Output Contract",
         "Return exactly one JSON object matching the provided schema. Do not wrap it in Markdown. If unsure about a field, still include the field with your best useful value. For arrays, return [] when no items are available. For booleans, return true or false. For nullable fields, use null when appropriate. Do not return explanatory prose outside the JSON object.",
         "",
@@ -64,7 +72,7 @@ def render_initial_worker_prompt(
     ]
     if worker.evidence_enabled:
         static_parts.append(
-            "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a request_id unique for this worker in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. Do not invoke shell commands, ARC CLIs, or MCP tools yourself."
+            "When controller evidence is needed, add arc_evidence_requests using the provided schema. Give each request a request_id unique for this worker in this loop round, an operation from caller_context.controller_evidence_operations when that list is present, JSON arguments, and a precise reason. Return [] or omit the field when no check is needed. The controller may resolve at most three evidence rounds and will return responses with provenance in a later turn. Follow the resolved ARC Paper Access capability above and do not invoke unrelated shell commands, ARC CLIs, or MCP tools."
         )
     static_prefix = "\n".join(static_parts).rstrip() + "\n\n"
     variable_suffix = "\n".join(
@@ -113,6 +121,7 @@ def render_proposer_delta_prompt(
     prompt = ensure_runtime_progress_contract("\n".join(
         [
             "## ARC-LLM Worker Delta Turn v2",
+            NESTED_SHELL_PROMPT_MARKER,
             "You are continuing the same proposer session. Use the remembered static task context, worker instructions, and current delta context.",
             "When Worker Instructions mention caller_context.X, read X from the remembered static caller_context plus the current Delta Context caller_context_delta. Current delta fields override older volatile fields.",
             "Treat prior unaccepted proposer outputs as tentative scratch work, not as facts. If reviewer or controller feedback identifies an error, asks for recalculation, changes the target, changes active proposer ids, or points to a convention/source-mapping issue, recompute the relevant reasoning from the original task context rather than merely patching your previous answer.",
@@ -153,6 +162,7 @@ def render_reviewer_delta_prompt(
     prompt = ensure_runtime_progress_contract("\n".join(
         [
             "## ARC-LLM Reviewer Delta Turn v2",
+            NESTED_SHELL_PROMPT_MARKER,
             "You are continuing the same reviewer session. Use the remembered static task context and worker instructions.",
             "When Worker Instructions mention caller_context.X, read X from the remembered static caller_context plus the current Delta Context caller_context_delta. Current delta fields override older volatile fields.",
             "Review the Current Proposer Outputs section independently for this turn. Previous review history is background only; do not let an older accepted/rejected judgment override the current proposer outputs, current active_proposer_ids, caller_context_delta, or current JSON schema.",

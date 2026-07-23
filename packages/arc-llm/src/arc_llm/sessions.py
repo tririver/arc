@@ -14,6 +14,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from .schema_cache import canonical_json, sha256_text
 from .runtime_manifest import runtime_manifest, runtime_manifest_fingerprint
+from .runtime_manifest import RUNTIME_MANIFEST_VERSION
 
 
 SessionPolicy = str
@@ -141,7 +142,7 @@ class LLMSessionManager:
                         metadata={
                             **dict(ref.metadata),
                             "arc_runtime_fingerprint_migrated_from": ref.runtime_fingerprint,
-                            "arc_runtime_manifest_version": "arc.llm.runtime_manifest.v1",
+                            "arc_runtime_manifest_version": RUNTIME_MANIFEST_VERSION,
                         },
                         generation=ref.generation,
                     )
@@ -176,7 +177,7 @@ class LLMSessionManager:
                         metadata={
                             **dict(ref.metadata),
                             "arc_runtime_fingerprint_migrated_from": ref.runtime_fingerprint,
-                            "arc_runtime_manifest_version": "arc.llm.runtime_manifest.v1",
+                            "arc_runtime_manifest_version": RUNTIME_MANIFEST_VERSION,
                             "arc_runtime_identity_transaction_validated": True,
                         }, generation=ref.generation,
                     )

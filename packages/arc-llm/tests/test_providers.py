@@ -1,10 +1,12 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from arc_llm.call_record import ARC_LLM_CALL_RECORD_FIELD
+from arc_llm.codex_binary import resolve_codex_binary
 from arc_llm.providers.base import LLMSchemaError, LLMWorkerError
 from arc_llm.providers import claude_cli as claude_module
 from arc_llm.providers import codex_cli as codex_module
@@ -76,7 +78,8 @@ def test_codex_generate_json_writes_prompt_to_stdin_and_reads_output(monkeypatch
     result = CodexCliProvider().generate_json("prompt text", schema={"type": "object"}, model="test-model")
 
     assert result == {"ok": True}
-    assert captured["cmd"][:2] == ["codex", "exec"]
+    assert captured["cmd"][0] == resolve_codex_binary(os.environ)
+    assert captured["cmd"][1] == "exec"
     assert "--ephemeral" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--sandbox") + 1] == "read-only"
     assert "--ignore-user-config" in captured["cmd"]

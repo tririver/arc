@@ -82,8 +82,11 @@ support, and detected risk categories and paths without printing configuration
 values or credentials.
 
 Codex and Claude internal workers disable inherited MCP, skills, plugins,
-rules, and other host configuration by default. Ordinary workers instead get
-the deterministic `arc-paper-worker` CLI. Generic `arc-llm` callers may opt in
+rules, and other host configuration by default. An ordinary worker receives
+direct `arc-paper-worker` instructions only when the runtime reports
+`nested_sandboxed_shell=true`; otherwise deterministic reads go through the
+Controller evidence protocol. Claude and Kimi are not treated as proven
+sandboxed shells. Generic `arc-llm` callers may opt in
 to all host tools with `--inherit-host-tools`; this is a high-risk per-run
 choice, is fingerprinted for audit/resume checks, and is not an ARC workflow
 default. ARC records paths and risk categories, not credentials or complete
@@ -106,6 +109,13 @@ default explicitly. Schema formatting, output recovery, provider preflight,
 and blind-reference workers always disable it regardless of ordinary runtime
 configuration. Checkpoints created before the access field existed resume as
 `none` instead of silently gaining access.
+
+For Codex `read-only` and `workspace-write`, ARC caches a short, harmless
+`codex sandbox` probe with network disabled. A namespace denial disables only
+the inner worker shell: it does not fail the model/provider call, switch
+providers, enable `danger-full-access`, or affect the outer ARC CLI. Doctor
+output reports only the stable capability classification and bounded receipt
+metadata, never the probe command, environment, or raw output.
 
 JSON output:
 
@@ -259,7 +269,8 @@ and injects only the addressed worker's exchanges into its next turn. Empty
 arrays are no-ops, malformed requests fail the loop, and resolver calls stop
 after three evidence rounds. A request in the final configured worker round is
 recorded with `no_followup_round` instead of being resolved, because no later
-turn could consume it. Workers never call ARC CLI, shell, or MCP tools.
+turn could consume it. Workers with a proven nested shell may call only the
+bounded paper worker; other workers never call ARC CLI, shell, or MCP tools.
 
 The ideas workflow installs an `arc-paper` service resolver by default. Its
 portable operations are `paper.metadata`, `paper.section`,

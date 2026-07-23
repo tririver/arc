@@ -546,13 +546,11 @@ def test_worker_prompt_advertises_only_the_paper_cli_and_nested_llm_guard():
 
     rendered = render_prompt(loop.proposers[0], context)
 
-    assert "you may invoke arc-paper-worker directly and repeatedly" in rendered
-    assert "Never invoke raw arc-paper, Python arc_paper modules" in rendered
-    assert "validated artifacts are promoted atomically" in rendered
-    assert "Command capability metadata rejects" in rendered
+    assert "{{ARC_NESTED_SHELL_CAPABILITY}}" in rendered
+    assert "arc-paper-worker" not in rendered
     assert "worker guard" not in rendered
     assert "trusted controller" not in rendered
-    assert "Except for arc-paper-worker" in rendered
+    assert "Follow the resolved ARC Paper Access capability" in rendered
 
 
 def test_worker_prompt_with_paper_cli_disabled_retains_blanket_tool_guard():
@@ -591,4 +589,4 @@ def test_worker_prompt_rewrites_legacy_controller_only_paper_wording():
     rendered = render_prompt(loop.proposers[0], context)
 
     assert "Do not invoke ARC CLIs" not in rendered
-    assert "Use arc-paper-worker for ARC paper evidence" in rendered
+    assert "Follow the resolved ARC Paper Access capability" in rendered

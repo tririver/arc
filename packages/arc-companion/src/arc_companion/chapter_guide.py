@@ -138,7 +138,8 @@ def generate_chapter_guide(
         "limitations, or the generation process. Supplementary reading may cite only evidence_id values in "
         "verified_evidence; do not repeat the source bibliography and do not invent references. "
         + (
-            "Use host internet search and arc-paper-worker when useful, and inspect every final cited page. "
+            "Use host internet search when useful, and inspect every final cited page. "
+            "{{ARC_NESTED_SHELL_CAPABILITY}} "
             if allow_internet else
             "Internet access is disabled. Cite only direct HTTP(S) URLs present in verified_evidence or other local "
             "evidence supplied in this prompt; omit every external claim that cannot be supported by that whitelist. "
@@ -152,8 +153,7 @@ def generate_chapter_guide(
 
         guidance_prefix = (
             worker_guidance_prompt_prefix(intent_guidance, lane="guide")
-            + "\nIf this host has no sandboxed shell, request exact cached reference reads "
-            "through arc_evidence_requests. Use list-reference-targets to inspect a "
+            + "\n{{ARC_NESTED_SHELL_CAPABILITY}} Use list-reference-targets to inspect a "
             "non-inline target catalog, then get-parsed-toc or get-parsed-section "
             "with source_id, locator, and optional byte offset/limit; return [] when "
             "no controller read is needed.\n"

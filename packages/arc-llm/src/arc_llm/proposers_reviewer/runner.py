@@ -7,7 +7,7 @@ import os
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, as_completed, wait
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from threading import Lock, Semaphore
 from typing import Any, Callable, Mapping
@@ -28,7 +28,7 @@ from arc_llm.evidence_journal import (
     EvidenceJournalContext,
     canonical_hash,
 )
-from arc_llm.runner import LLMNeedsLLM, resolve_llm_config, run_json
+from arc_llm.runner import LLMNeedsLLM, prepare_runtime_prompt, resolve_llm_config, run_json
 from arc_llm.providers.base import (
     LLMAbortScope,
     LLMSchemaError,
@@ -999,6 +999,22 @@ def _call_json_runner_with_prompt_options(
         nonlocal selected
         turn_kind = _locked_turn_kind(loop, session_manager, session_key, prompt_options)
         selected = prompt_options[turn_kind]
+        prompt_env = worker_env(worker, base_env=base_env)
+        rendered_prompt, rendered_prefix, _ = prepare_runtime_prompt(
+            selected.prompt,
+            provider=worker.provider,
+            model=worker.model,
+            model_tier=worker.model_tier,
+            env=prompt_env,
+            process_chain=process_chain,
+            artifact_dir=artifact_dir,
+            session_manager=session_manager,
+            schema=worker.output_schema,
+            static_prefix=selected.static_prefix,
+        )
+        selected = replace(
+            selected, prompt=rendered_prompt, static_prefix=rendered_prefix
+        )
         context = copy.deepcopy(selected.context)
         context.update({"session_key": session_key, "history_mode": loop.session.history_mode})
         atomic_write_json(context_path, context)
@@ -1080,6 +1096,18 @@ def _call_json_runner(
     idle_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     env = worker_env(worker, base_env=base_env)
+    prompt, static_prefix, _ = prepare_runtime_prompt(
+        prompt,
+        provider=worker.provider,
+        model=worker.model,
+        model_tier=worker.model_tier,
+        env=env,
+        process_chain=process_chain,
+        artifact_dir=artifact_dir,
+        session_manager=session_manager,
+        schema=worker.output_schema,
+        static_prefix=static_prefix,
+    )
     effective_session_policy = session_policy
     if json_runner is not None and session_policy == "stateful" and not _declares_keyword(json_runner, "session_policy"):
         effective_session_policy = "stateless"

@@ -6,12 +6,15 @@ note, or book. It consumes a rich source plus its paired PDF through
 renders and validates both a PDF and a static-web reader deterministically. The
 core workflow is CLI-only and portable across supported agent hosts.
 
-Chapter workers use `arc-paper-worker` by default for deterministic access to
-the shared paper cache and run overlay. They do not inherit the user's MCP,
+Chapter workers use `arc-paper-worker` directly only when the resolved runtime
+capability proves a nested sandboxed shell. Otherwise the same deterministic
+reads use addressed Controller evidence requests; this does not switch the
+provider, enable unsafe sandbox access, or affect the outer companion CLI.
+They do not inherit the user's MCP,
 skills, plugins, rules, or extra CLIs unless the run explicitly enables the
 high-risk `inherit_host_tools` option. When internet access is enabled, the
-commentary agent may use host search and `arc-paper-worker` directly in its
-generation turn.
+commentary agent may use host search, while direct `arc-paper-worker` use still
+requires the explicit runtime capability.
 
 ## Phase 1: Source and Structure
 

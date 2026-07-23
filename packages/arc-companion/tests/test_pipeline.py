@@ -3513,18 +3513,6 @@ def test_offline_translation_session_keeps_same_runtime_for_token_repair(
         provider="codex-cli",
     )
     manager = LLMSessionManager(tmp_path / "sessions")
-    offline_env = pipeline_module._llm_runtime_env(
-        allow_internet=False, force_disable_internet=True, inherit_host_tools=False,
-    )
-    runtime_fingerprint = _runtime_fp(
-        provider_used="codex-cli", model=None,
-        model_tier=pipeline_module.TRANSLATION_TIER,
-        env=offline_env, process_chain=None,
-    )
-    manager.get_or_create(
-        key="ch:translation", provider="codex-cli", model=None,
-        runtime_fingerprint=runtime_fingerprint,
-    )
     labels: list[str] = []
 
     def stateful_llm(prompt: str, **kwargs):
@@ -3535,6 +3523,11 @@ def test_offline_translation_session_keeps_same_runtime_for_token_repair(
             model_tier=kwargs.get("model_tier"), env=kwargs.get("env"),
             process_chain=None,
         )
+        if manager.get_existing("ch:translation") is None:
+            manager.get_or_create(
+                key="ch:translation", provider="codex-cli", model=None,
+                runtime_fingerprint=fingerprint,
+            )
         with manager.locked_turn(
             key="ch:translation", provider="codex-cli", model=None,
             runtime_fingerprint=fingerprint,
@@ -6395,7 +6388,7 @@ def test_disabled_paper_cli_also_forces_bare_host_isolation(monkeypatch) -> None
     assert "ARC_CLAUDE_MCP_CONFIG" not in env
 
 
-def test_guided_reference_policy_exposes_only_command_scoped_claude_bash() -> None:
+def test_guided_reference_policy_does_not_assume_claude_bash_sandbox() -> None:
     env = pipeline_module._llm_runtime_env(
         allow_internet=False,
         inherit_host_tools=False,
@@ -6409,13 +6402,8 @@ def test_guided_reference_policy_exposes_only_command_scoped_claude_bash() -> No
             ],
         },
     )
-    assert env["ARC_CLAUDE_TOOLS"] == "Bash"
-    assert env["ARC_CLAUDE_ALLOWED_TOOLS"].split(",") == [
-        "Bash(arc-paper-worker get-parsed-toc:*)",
-        "Bash(arc-paper-worker get-parsed-section:*)",
-        "Bash(arc-paper-worker policy-targets:*)",
-        "Bash(arc-paper-worker artifact-read:*)",
-    ]
+    assert env["ARC_CLAUDE_TOOLS"] == ""
+    assert env["ARC_CLAUDE_ALLOWED_TOOLS"] == ""
     assert json.loads(env["ARC_PAPER_WORKER_ALLOWED_OPERATIONS_JSON"]) == [
         "artifact-read", "get-parsed-toc", "get-parsed-section",
     ]

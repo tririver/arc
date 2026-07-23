@@ -42,6 +42,17 @@ from .json_schema import (
     with_canonical_json_schema_contract,
 )
 from .model import reasoning_effort_for_model_tier, resolve_model_with_warnings
+from .nested_shell_capability import (
+    NESTED_SHELL_CAPABILITY_SCHEMA_VERSION,
+    NESTED_SHELL_PROBE_ID,
+    NestedShellCapability,
+    apply_runtime_capability,
+    capability_runtime_identity,
+    clear_runtime_capability_values,
+    nested_shell_warning_from_codex_events,
+    render_nested_shell_prompt,
+    resolve_nested_shell_capability,
+)
 from .paper_access_policy import (
     PAPER_ACCESS_POLICY_VERSION,
     canonical_paper_access_policy,
@@ -62,6 +73,7 @@ from .response_candidates import (
     persist_selection_receipt,
     select_response_candidate,
 )
+from .runtime_manifest import RUNTIME_MANIFEST_VERSION
 from .providers.registry import get_provider_spec
 from .providers.select import select_provider
 from .schema_cache import canonical_json, schema_hash, sha256_text
@@ -87,8 +99,10 @@ def _runtime_capabilities(env: Mapping[str, str] | None) -> dict[str, Any]:
     values = env or {}
     return {
         "arc_paper_cli_access": values.get("ARC_PAPER_CLI_ACCESS", "full"),
+        "arc_paper_access": "full",
         "inherit_host_tools": values.get("ARC_LLM_INHERIT_HOST_TOOLS", "false").strip().lower()
         == "true",
+        **capability_runtime_identity(values),
     }
 
 
@@ -104,6 +118,7 @@ def _runtime_compatibility_policy(
 ) -> tuple[dict[str, str], dict[str, Any]]:
     """Default new calls to paper access while keeping legacy resumptions closed."""
     effective_env = dict(os.environ if env is None else env)
+    clear_runtime_capability_values(effective_env)
     effective_env.setdefault("ARC_PAPER_CLI_ACCESS", "full")
     effective_env.setdefault("ARC_LLM_INHERIT_HOST_TOOLS", "false")
     legacy_resume = False
@@ -132,7 +147,100 @@ def _runtime_compatibility_policy(
 
     effective_metadata = dict(session_metadata or {})
     effective_metadata["arc_runtime_capabilities"] = _runtime_capabilities(effective_env)
+    effective_metadata["arc_runtime_manifest_version"] = RUNTIME_MANIFEST_VERSION
     return effective_env, effective_metadata
+
+
+def _resolve_request_nested_shell(
+    configs: Sequence["LLMConfig"], env: dict[str, str]
+) -> NestedShellCapability:
+    provider = configs[0].provider
+    if env.get("ARC_PAPER_CLI_ACCESS", "full") != "full":
+        capability = NestedShellCapability(
+            schema_version=NESTED_SHELL_CAPABILITY_SCHEMA_VERSION,
+            provider=provider,
+            nested_sandboxed_shell=False,
+            status="not_requested",
+            probe_kind="none",
+            probe_identity=NESTED_SHELL_PROBE_ID,
+            warning="nested_shell.not_requested",
+        )
+    else:
+        capability = resolve_nested_shell_capability(
+            provider=provider,
+            env=env,
+            cwd=env.get("ARC_CODEX_WORK_DIR"),
+        )
+    apply_runtime_capability(env, capability)
+    return capability
+
+
+def _controller_evidence_exposed(schema: Mapping[str, Any] | None) -> bool:
+    if not isinstance(schema, Mapping):
+        return False
+    properties = schema.get("properties")
+    return isinstance(properties, Mapping) and "arc_evidence_requests" in properties
+
+
+def prepare_runtime_prompt(
+    prompt: str,
+    *,
+    provider: str,
+    model: str | None,
+    model_tier: str | None,
+    env: dict[str, str],
+    process_chain: Sequence[str] | None = None,
+    artifact_dir: Path | None = None,
+    session_manager: LLMSessionManager | None = None,
+    schema: Mapping[str, Any] | None = None,
+    static_prefix: str | None = None,
+    stage_paper_worker: bool = True,
+) -> tuple[str, str | None, NestedShellCapability]:
+    """Render the portable marker before custom-runner artifacts or hashing."""
+
+    clear_runtime_capability_values(env)
+    configs = resolve_llm_configs(
+        provider=provider,
+        model=model,
+        model_tier=model_tier,
+        env=env,
+        process_chain=process_chain,
+    )
+    if stage_paper_worker:
+        _configure_paper_worker_session(
+            env, artifact_dir=artifact_dir, session_manager=session_manager
+        )
+    capability = _resolve_request_nested_shell(configs, env)
+    exposed = _controller_evidence_exposed(schema)
+    rendered = render_nested_shell_prompt(
+        prompt, capability, controller_evidence_exposed=exposed
+    )
+    rendered_prefix = (
+        render_nested_shell_prompt(
+            static_prefix, capability, controller_evidence_exposed=exposed
+        )
+        if static_prefix is not None
+        else None
+    )
+    return rendered, rendered_prefix, capability
+
+
+def _nested_shell_warnings(
+    env: Mapping[str, str] | None,
+    *,
+    raw_events: Sequence[Mapping[str, Any]] = (),
+) -> tuple[str, ...]:
+    identity = capability_runtime_identity(env)
+    warnings: list[str] = []
+    if (
+        (env or {}).get("ARC_PAPER_CLI_ACCESS", "full") == "full"
+        and identity["nested_shell_status"] != "available"
+    ):
+        warnings.append(f"nested_shell.{identity['nested_shell_status']}")
+    typed_warning = nested_shell_warning_from_codex_events(raw_events)
+    if typed_warning is not None:
+        warnings.append(typed_warning)
+    return tuple(dict.fromkeys(warnings))
 
 
 def _configure_paper_worker_session(
@@ -646,6 +754,16 @@ def run_json_result(
     )
     _stage_paper_access_policy(env, paper_access_policy)
     _validate_runtime_preflight(configs, env=env, idle_timeout_seconds=idle_timeout_seconds)
+    nested_shell = _resolve_request_nested_shell(configs, env)
+    apply_runtime_capability(schema_canary_runtime_env, nested_shell)
+    controller_exposed = _controller_evidence_exposed(schema)
+    prompt = render_nested_shell_prompt(
+        prompt, nested_shell, controller_evidence_exposed=controller_exposed
+    )
+    if static_prefix is not None:
+        static_prefix = render_nested_shell_prompt(
+            static_prefix, nested_shell, controller_evidence_exposed=controller_exposed
+        )
     session_metadata["arc_runtime_capabilities"] = _runtime_capabilities(env)
     return _run_with_retries(
         configs,
@@ -863,6 +981,14 @@ def run_text_result(
     )
     _stage_paper_access_policy(env, paper_access_policy)
     _validate_runtime_preflight(configs, env=env, idle_timeout_seconds=idle_timeout_seconds)
+    nested_shell = _resolve_request_nested_shell(configs, env)
+    prompt = render_nested_shell_prompt(
+        prompt, nested_shell, controller_evidence_exposed=False
+    )
+    if static_prefix is not None:
+        static_prefix = render_nested_shell_prompt(
+            static_prefix, nested_shell, controller_evidence_exposed=False
+        )
     session_metadata["arc_runtime_capabilities"] = _runtime_capabilities(env)
     return _run_with_retries(
         configs,
@@ -1743,7 +1869,10 @@ def _generate_json(
             response=response,
         ),
         structured_output=structured_output,
-        warnings=schema_plan.warnings,
+        warnings=tuple(dict.fromkeys((
+            *schema_plan.warnings,
+            *_nested_shell_warnings(env, raw_events=response.raw_events),
+        ))),
     )
 
 
@@ -2007,6 +2136,7 @@ def _generate_text(
             prepared=prepared_checkpoint,
             response=response,
         ),
+        warnings=_nested_shell_warnings(env, raw_events=response.raw_events),
     )
 
 
@@ -2036,6 +2166,12 @@ def _migrate_legacy_session_runtime(
     existing = session_manager.get_existing(session_key)
     if existing is None or existing.runtime_fingerprint == runtime_fp:
         return
+    if (
+        existing.native_session_id
+        and existing.metadata.get("arc_runtime_manifest_version")
+        != RUNTIME_MANIFEST_VERSION
+    ):
+        return
     if validated_runtime_identity is not None:
         migrated = session_manager.migrate_validated_runtime_identity(
             session_key, identity=validated_runtime_identity,
@@ -2043,6 +2179,10 @@ def _migrate_legacy_session_runtime(
         )
         if migrated is not None:
             return
+    # Runtime-manifest v1 did not record whether direct nested-shell
+    # instructions were safe. It must not be proof-migrated into v2.
+    if capability_runtime_identity(env)["nested_shell_status"] != "not_requested":
+        return
     legacy_fp = legacy_runtime_fingerprint(
         provider=provider, model=model, model_tier=model_tier,
         env=env, process_chain=process_chain,

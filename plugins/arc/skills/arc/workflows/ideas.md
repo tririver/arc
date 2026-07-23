@@ -77,10 +77,11 @@ variable. `SIGINT`, `SIGTERM`, and background cancellation remain available.
 Step 2: Print any returned `WARNING:` messages. For loop concurrency, see
 `manuals/arc-llm.md`.
 
-Proposers and reviewers use `arc-paper-worker` directly when their host offers
-reliable shell execution. They may query it repeatedly in one turn; writes go
+Proposers and reviewers use `arc-paper-worker` directly only when the resolved
+runtime capability reports `nested_sandboxed_shell=true`. They may query it
+repeatedly in one turn; writes go
 to the run overlay and validated records are promoted automatically. On hosts
-without direct CLI support, the workflow controller resolves equivalent
+without that capability, the workflow Controller resolves equivalent
 structured evidence requests through the deterministic `arc-paper` service
 between rounds and returns provenance in the next worker context. Other ARC
 CLIs, nested LLM entry points, and MCP tools remain unavailable. See

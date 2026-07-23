@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .schema_cache import canonical_json, sha256_text
+from .nested_shell_capability import capability_runtime_identity
 
 
-RUNTIME_MANIFEST_VERSION = "arc.llm.runtime_manifest.v1"
+RUNTIME_MANIFEST_VERSION = "arc.llm.runtime_manifest.v2"
 
 _SHARED_RECIPE_KEYS = {
     "ARC_PAPER_CLI_ACCESS",
@@ -91,7 +92,10 @@ def runtime_manifest(
         ):
             recipe_env.pop(key, None)
 
-    recipe: dict[str, Any] = {"env": recipe_env}
+    recipe: dict[str, Any] = {
+        "env": recipe_env,
+        "capabilities": capability_runtime_identity(source),
+    }
     file_hashes = _provider_file_hashes(provider, source)
     if file_hashes:
         recipe["file_hashes"] = file_hashes

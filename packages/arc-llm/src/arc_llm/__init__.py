@@ -34,6 +34,12 @@ from .evidence_journal import (
 from .failure_classification import classify_provider_diagnostic, disposition_error_kwargs
 from .host import HostDetection, ProviderSelection, detect_host, select_llm_provider
 from .model import ModelTierError, resolve_model
+from .nested_shell_capability import (
+    NESTED_SHELL_PROMPT_MARKER,
+    NestedShellCapability,
+    render_nested_shell_prompt,
+    resolve_nested_shell_capability,
+)
 from .recovery_context import LLMRecoveryContext, read_recovery_context
 from .runtime_manifest import (
     RUNTIME_MANIFEST_VERSION,
@@ -102,6 +108,8 @@ __all__ = [
     "RUNTIME_MANIFEST_VERSION",
     "ModelTierError",
     "MAX_EVIDENCE_ROUNDS",
+    "NESTED_SHELL_PROMPT_MARKER",
+    "NestedShellCapability",
     "ProviderSelection",
     "SupervisedNativeResumeAuthorization",
     "ARC_LLM_CALL_RECORD_FIELD",
@@ -117,6 +125,8 @@ __all__ = [
     "resolve_llm_config",
     "resolve_evidence_round",
     "resolve_model",
+    "render_nested_shell_prompt",
+    "resolve_nested_shell_capability",
     "read_recovery_context",
     "runtime_manifest",
     "runtime_manifest_fingerprint",
