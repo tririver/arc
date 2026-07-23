@@ -565,20 +565,27 @@ def test_explicit_current_overrides_read_legacy_reader_final_without_rewrite(
     path = checkpoint / "reader-final.json"
     write_json(path, {
         "schema_version": "arc.companion.reader-final.v3",
-        "final_overrides": {"metadata": {"title": "Legacy checkpoint"}},
+        "final_overrides": {
+            "metadata": {"title": "Legacy checkpoint"},
+            "translation_mode": "skipped",
+        },
     })
     before = path.read_bytes()
 
     snapshot = build_reader_snapshot(
         project,
-        final_overrides={"metadata": {"title": "Current render"}},
+        final_overrides={
+            "metadata": {"title": "Current render"},
+            "source_credit": read_json(checkpoint / "source-credit.json"),
+        },
     )
 
     assert snapshot["title"] == "Current render"
+    assert snapshot["translation_mode"] == "enabled"
     assert path.read_bytes() == before
-    with pytest.raises(WebReaderError, match="checkpoint schema"):
+    with pytest.raises(WebReaderError, match="requires current source credit"):
         build_reader_snapshot(project)
-    with pytest.raises(WebReaderError, match="checkpoint schema"):
+    with pytest.raises(WebReaderError, match="requires current source credit"):
         build_reader_snapshot(project, final_overrides={})
 
 
@@ -605,7 +612,10 @@ def test_explicit_current_overrides_reject_other_or_malformed_reader_final(
     with pytest.raises(WebReaderError, match=error):
         build_reader_snapshot(
             project,
-            final_overrides={"metadata": {"title": "Current render"}},
+            final_overrides={
+                "metadata": {"title": "Current render"},
+                "source_credit": read_json(checkpoint / "source-credit.json"),
+            },
         )
 
 

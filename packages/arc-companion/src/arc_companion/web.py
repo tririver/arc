@@ -130,7 +130,7 @@ def build_reader_snapshot(
     current_state = _state(root, state)
     checkpoint = _checkpoint(root, current_state)
     saved_overrides = _reader_final_overrides(
-        checkpoint, allow_legacy=bool(final_overrides),
+        checkpoint, replacement_overrides=final_overrides,
     )
     _require_final_reader_payload(
         current_state,
@@ -449,7 +449,7 @@ def prepare_reader_publish(
     current_state = _state(root, state)
     checkpoint = _checkpoint(root, current_state)
     _reader_final_overrides(
-        checkpoint, allow_legacy=bool(final_overrides),
+        checkpoint, replacement_overrides=final_overrides,
     )
     _require_final_reader_payload(
         current_state,
@@ -1605,7 +1605,7 @@ def _checkpoint(root: Path, state: Mapping[str, Any]) -> Path | None:
 def _reader_final_overrides(
     checkpoint: Path | None,
     *,
-    allow_legacy: bool = False,
+    replacement_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if checkpoint is None:
         return {}
@@ -1614,17 +1614,39 @@ def _reader_final_overrides(
         return {}
     value = _read_object(path, label="reader final checkpoint")
     version = value.get("schema_version")
-    if (
-        version != READER_FINAL_VERSION
-        and not (
-            allow_legacy
-            and version == _LEGACY_READER_FINAL_VERSION
-        )
-    ):
+    if version not in {
+        READER_FINAL_VERSION,
+        _LEGACY_READER_FINAL_VERSION,
+    }:
         raise WebReaderError("reader final checkpoint schema is invalid")
     overrides = value.get("final_overrides")
     if not isinstance(overrides, Mapping):
         raise WebReaderError("reader final checkpoint has no final_overrides object")
+    if version == _LEGACY_READER_FINAL_VERSION:
+        replacement_content = (
+            replacement_overrides.get("content")
+            if isinstance(replacement_overrides, Mapping)
+            else None
+        )
+        replacement_credit = (
+            replacement_overrides.get("source_credit")
+            if isinstance(replacement_overrides, Mapping)
+            else None
+        ) or (
+            replacement_content.get("source_credit")
+            if isinstance(replacement_content, Mapping)
+            else None
+        )
+        try:
+            validate_source_credit(replacement_credit)
+        except (SourceCreditError, TypeError) as exc:
+            raise WebReaderError(
+                "legacy reader final checkpoint requires current source credit"
+            ) from exc
+        # v3 predates source-credit-complete final payloads.  Validate its
+        # envelope, but never merge stale optional fields into a current
+        # replacement supplied by the caller.
+        return {}
     return deepcopy(dict(overrides))
 
 
@@ -2614,7 +2636,7 @@ def _prepare_source_assets(
     checkpoint = _checkpoint(root, state)
     overrides = _deep_merge(
         _reader_final_overrides(
-            checkpoint, allow_legacy=bool(final_overrides),
+            checkpoint, replacement_overrides=final_overrides,
         ),
         final_overrides or {},
     )
