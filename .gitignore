@@ -2,11 +2,13 @@
 0_ref/
 cache/
 arc-tests/
+local/
 .worktrees/
 .understandignore
 .understand-anything/
 .claude/
 superpowers/
+docs/
 
 # Local secrets and provider credentials
 .env

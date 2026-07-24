@@ -1,8 +1,7 @@
 # ARC Development Guidance
 
 This repository contains ARC research tooling rebuilt as Python packages plus
-thin agent adapters. The reference snapshot in `0_ref/` is read-only context and
-must not be modified.
+thin agent adapters. 
 
 ## Project Map
 
@@ -149,8 +148,6 @@ tools it names.
   `arc_domain`, and batch service functions.
 - `plugins/arc/skills/arc`, `prompts/`, `schemas/`, and plugin manifests
   should describe or wrap package behavior rather than reimplementing it.
-- Keep `0_ref/` as reference-only material. Do not preserve old compatibility
-  when it conflicts with the new package architecture.
 
 ## Long-Running Terminal Work
 
@@ -203,13 +200,13 @@ tools it names.
   in their designated repository locations. For every non-development
   execution that uses or evaluates ARC—including workflow tests, benchmarks,
   integration or evaluation runs, and ordinary research use—create the project
-  or run directory under the git-ignored `arc-tests/` tree and write all
+  or run directory under the git-ignored `local/` tree and write all
   generated artifacts there. Do not create ad hoc project, run, benchmark, or
   output directories at the repository root, under `packages/` or `plugins/`,
   or elsewhere in source directories.
 - Never write test, workflow, benchmark, evaluation, preview, render, log, or
   other run-generated information to a path that is not covered by the
-  repository's git-ignore rules. Use `arc-tests/` for all such output, and
+  repository's git-ignore rules. Use `local/` for all such output, and
   verify the selected path is ignored before starting the run.
 - Workflow runs that exercise planning should write
   `<project-dir>/work-note.md` and archived work-note versions under the run
