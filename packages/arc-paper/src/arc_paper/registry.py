@@ -104,6 +104,119 @@ _SOURCE_ARTIFACT_SCHEMA = _object(
         "origin",
     ),
 )
+_HTML_DEPENDENCY_WARNING_SCHEMA = _object(
+    {
+        "code": _NONEMPTY_STRING,
+        "message": _NONEMPTY_STRING,
+        "dependency_ordinal": {"type": ["integer", "null"], "minimum": 0},
+        "element": _STRING,
+        "attribute": _STRING,
+        "authored_target": _STRING,
+    },
+    required=(
+        "code",
+        "message",
+        "dependency_ordinal",
+        "element",
+        "attribute",
+        "authored_target",
+    ),
+)
+_HTML_DEPENDENCY_SCHEMA = _object(
+    {
+        "ordinal": {"type": "integer", "minimum": 0},
+        "element": {"enum": ["img", "object", "source"]},
+        "attribute": {"enum": ["data", "src", "srcset"]},
+        "authored_target": _STRING,
+        "request_url": _STRING,
+        "resolved_url": _STRING,
+        "declared_media_type": _STRING,
+        "availability": {"enum": ["available", "unavailable"]},
+        "media_type": _STRING,
+        "artifact_digest": _STRING,
+        "size": {"type": "integer", "minimum": 0},
+        "error_code": _STRING,
+        "error_message": _STRING,
+    },
+    required=(
+        "ordinal",
+        "element",
+        "attribute",
+        "authored_target",
+        "request_url",
+        "resolved_url",
+        "declared_media_type",
+        "availability",
+        "media_type",
+        "artifact_digest",
+        "size",
+        "error_code",
+        "error_message",
+    ),
+)
+_HTML_SOURCE_BUNDLE_SCHEMA = _object(
+    {
+        "primary": _SOURCE_ARTIFACT_SCHEMA,
+        "provider": {"enum": ["arxiv-html", "ar5iv"]},
+        "document_url": _NONEMPTY_STRING,
+        "base_url": _NONEMPTY_STRING,
+        "acquisition_policy": _object(
+            {
+                "max_dependency_count": {"type": "integer", "minimum": 1},
+                "max_dependency_bytes": {"type": "integer", "minimum": 1},
+                "max_total_dependency_bytes": {"type": "integer", "minimum": 1},
+                "max_redirects": {"type": "integer", "minimum": 0},
+            },
+            required=(
+                "max_dependency_count",
+                "max_dependency_bytes",
+                "max_total_dependency_bytes",
+                "max_redirects",
+            ),
+        ),
+        "dependencies": {"type": "array", "items": _HTML_DEPENDENCY_SCHEMA},
+        "warnings": {"type": "array", "items": _HTML_DEPENDENCY_WARNING_SCHEMA},
+        "bundle_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    },
+    required=(
+        "primary",
+        "provider",
+        "document_url",
+        "base_url",
+        "acquisition_policy",
+        "dependencies",
+        "warnings",
+        "bundle_digest",
+    ),
+)
+_HTML_BUNDLE_EXPORT_RESOURCE_SCHEMA = _object(
+    {
+        "ordinal": {"type": "integer", "minimum": 0},
+        "authored_target": _NONEMPTY_STRING,
+        "path": _NONEMPTY_STRING,
+        "artifact_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "media_type": _NONEMPTY_STRING,
+        "size": {"type": "integer", "minimum": 0},
+    },
+    required=(
+        "ordinal",
+        "authored_target",
+        "path",
+        "artifact_digest",
+        "media_type",
+        "size",
+    ),
+)
+_HTML_BUNDLE_EXPORT_SCHEMA = _object(
+    {
+        "source": _NONEMPTY_STRING,
+        "manifest": _NONEMPTY_STRING,
+        "bundle_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "resources": {"type": "array", "items": _HTML_BUNDLE_EXPORT_RESOURCE_SCHEMA},
+        "warnings": {"type": "array", "items": _HTML_DEPENDENCY_WARNING_SCHEMA},
+    },
+    required=("source", "manifest", "bundle_digest", "resources", "warnings"),
+)
 _IDENTIFIERS_SCHEMA = {
     "type": "object",
     "additionalProperties": {"type": "string"},
@@ -1447,6 +1560,41 @@ _OPERATIONS = (
         service.fetch_arxiv_pdf,
         output_schema=_SOURCE_ARTIFACT_SCHEMA,
         effects=_NETWORK_CACHE,
+    ),
+    _spec(
+        "fetch-arxiv-html-bundle",
+        _object(
+            {
+                **_PAPER,
+                **_REFRESH,
+                "cache_root": {"type": ["string", "null"]},
+            },
+            required=("paper_id",),
+        ),
+        service.fetch_arxiv_html_bundle,
+        output_schema=_HTML_SOURCE_BUNDLE_SCHEMA,
+        effects=_NETWORK_CACHE,
+    ),
+    _spec(
+        "export-arxiv-html-bundle",
+        _object(
+            {
+                **_PAPER,
+                **_REFRESH,
+                "output_dir": _NONEMPTY_STRING,
+                "cache_root": {"type": ["string", "null"]},
+            },
+            required=("paper_id", "output_dir"),
+        ),
+        service.export_arxiv_html_bundle,
+        output_schema=_HTML_BUNDLE_EXPORT_SCHEMA,
+        effects=frozenset(
+            {
+                OperationEffect.NETWORK,
+                OperationEffect.CACHE_WRITE,
+                OperationEffect.ARBITRARY_LOCAL_PATH,
+            }
+        ),
     ),
     _spec(
         "import-source",

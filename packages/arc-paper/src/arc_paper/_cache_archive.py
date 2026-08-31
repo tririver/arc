@@ -18,6 +18,12 @@ from ac_jobs import canonical_json_bytes as _canonical_json_bytes
 
 from ._cache_admin import CACHE_INDEX_SCHEMA, CacheAdministrator, CacheEntry
 from ._cache_root import resolve_cache_root
+from .html_dependencies import (
+    AR5IV_HTML_DEPENDENCY_NAMESPACE,
+    ARXIV_HTML_DEPENDENCY_NAMESPACE,
+    bundle_resource_identities,
+)
+from .reference_cache import ReferenceMaterialCache
 from ac_jobs import file_matches_sha256
 from .source_repository import SourceRepository
 from .sources import SourceFormat
@@ -306,6 +312,27 @@ def _add_remote_entry(root: Path, entry_id: str, paths: set[str]) -> None:
             raise CacheArchiveError(
                 "cache_archive_dependency_corrupt", f"remote JSON payload is corrupt: {entry_id}"
             )
+        if namespace in {
+            ARXIV_HTML_DEPENDENCY_NAMESPACE,
+            AR5IV_HTML_DEPENDENCY_NAMESPACE,
+        }:
+            try:
+                payload = json.loads((directory / payload_name).read_text(encoding="utf-8"))
+                references = bundle_resource_identities(payload)
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise CacheArchiveError(
+                    "cache_archive_dependency_corrupt",
+                    f"HTML dependency bundle is invalid: {entry_id}",
+                ) from exc
+            for reference in references:
+                _add_reference_resource(root, reference, paths)
     else:
         _add_source_object(root, manifest, paths)
     _add_directory_files(root, directory, paths)
@@ -422,6 +449,39 @@ def _add_source_object(root: Path, identity: Mapping[str, Any], paths: set[str])
     directory = (
         root / "source-repository" / "v1" / resolved_format.value / "sha256"
         / str(digest)[:2] / str(digest)
+    )
+    _add_directory_files(root, directory, paths)
+
+
+def _add_reference_resource(
+    root: Path,
+    reference: Any,
+    paths: set[str],
+) -> None:
+    cache = ReferenceMaterialCache(root)
+    try:
+        payload = cache.read_resource(reference)
+    except Exception as exc:
+        raise CacheArchiveError(
+            "cache_archive_dependency_corrupt",
+            f"HTML dependency resource is missing or corrupt: {reference.resource_sha256}",
+        ) from exc
+    if (
+        len(payload) != reference.resource_size
+        or hashlib.sha256(payload).hexdigest() != reference.resource_sha256
+    ):
+        raise CacheArchiveError(
+            "cache_archive_dependency_corrupt",
+            f"HTML dependency resource metadata conflicts: {reference.resource_sha256}",
+        )
+    directory = (
+        root
+        / "reference-material-cache"
+        / "v1"
+        / "resources"
+        / "sha256"
+        / reference.resource_sha256[:2]
+        / reference.resource_sha256
     )
     _add_directory_files(root, directory, paths)
 

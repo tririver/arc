@@ -21,6 +21,10 @@ from ac_jobs import (
 
 from ._cache_root import resolve_cache_root
 from .ids import normalize_paper_id
+from .html_dependencies import (
+    AR5IV_HTML_DEPENDENCY_NAMESPACE,
+    ARXIV_HTML_DEPENDENCY_NAMESPACE,
+)
 from .providers.remote_cache import RemoteCacheAdminEntry, RemoteRequestCache
 
 
@@ -327,13 +331,18 @@ def _paper_component_from_remote(
     if entry.namespace in {
         "arxiv-html",
         "arxiv-html-availability",
+        ARXIV_HTML_DEPENDENCY_NAMESPACE,
         "ar5iv-html",
+        AR5IV_HTML_DEPENDENCY_NAMESPACE,
         "arxiv-pdf",
     }:
         paper_id = normalize_paper_id(f"arXiv:{entry.request_key}")
         return (
             paper_id or None,
-            entry.namespace,
+            {
+                ARXIV_HTML_DEPENDENCY_NAMESPACE: "arxiv-html",
+                AR5IV_HTML_DEPENDENCY_NAMESPACE: "ar5iv-html",
+            }.get(entry.namespace, entry.namespace),
         )
     return None, ""
 

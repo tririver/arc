@@ -68,6 +68,56 @@ def arxiv_path_id(identifier: str) -> str:
     return _normalized_arxiv_id(identifier)
 
 
+def arxiv_version(identifier: str) -> str:
+    """Return an explicit valid ``vN`` suffix without changing canonical IDs."""
+
+    aid = arxiv_path_id(identifier)
+    if not aid:
+        return ""
+    suffix = _arxiv_explicit_version_suffix(identifier, aid)
+    return (
+        suffix.casefold()
+        if suffix is not None
+        and re.fullmatch(r"v[1-9][0-9]*", suffix, flags=re.IGNORECASE)
+        else ""
+    )
+
+
+def arxiv_version_is_invalid(identifier: str) -> bool:
+    """Return whether an otherwise valid arXiv ID has an invalid vN suffix."""
+
+    aid = arxiv_path_id(identifier)
+    if not aid:
+        return False
+    suffix = _arxiv_explicit_version_suffix(identifier, aid)
+    return suffix is not None and re.fullmatch(
+        r"v[1-9][0-9]*", suffix, flags=re.IGNORECASE
+    ) is None
+
+
+def arxiv_versioned_path_id(identifier: str) -> str:
+    """Return the canonical path ID plus an explicit version when supplied."""
+
+    aid = arxiv_path_id(identifier)
+    if arxiv_version_is_invalid(identifier):
+        return ""
+    return f"{aid}{arxiv_version(identifier)}" if aid else ""
+
+
+def _arxiv_explicit_version_suffix(identifier: str, aid: str) -> str | None:
+    escaped = re.escape(aid)
+    text = str(identifier or "").strip()
+    patterns = (
+        rf"(?:arxiv:)?{escaped}(v[0-9]+)",
+        rf"(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf)/"
+        rf"{escaped}(v[0-9]+)(?:\.pdf)?/?(?:[?#].*)?",
+    )
+    for pattern in patterns:
+        if match := re.fullmatch(pattern, text, flags=re.IGNORECASE):
+            return match.group(1)
+    return None
+
+
 def inspire_recid(identifier: str) -> str:
     normalized = normalize_paper_id(identifier)
     if not normalized.startswith("inspire:"):

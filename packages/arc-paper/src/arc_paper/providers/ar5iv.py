@@ -4,7 +4,19 @@ from pathlib import Path
 
 import httpx
 
+from ..html_dependencies import (
+    AR5IV_HTML_DEPENDENCY_NAMESPACE,
+    DEFAULT_MAX_DEPENDENCY_BYTES,
+    DEFAULT_MAX_DEPENDENCY_COUNT,
+    DEFAULT_MAX_DEPENDENCY_REDIRECTS,
+    DEFAULT_MAX_TOTAL_DEPENDENCY_BYTES,
+    HtmlSourceBundle,
+    HtmlSourceBundleError,
+    fetch_cached_html_bundle,
+    fetch_safe_response,
+)
 from ..ids import arxiv_path_id
+from ..reference_cache import ReferenceMaterialCache
 from ..source_repository import SourceRepository
 from ..sources import SourceArtifact, SourceFormat, SourceOrigin, SourceOriginKind
 from ._http import require_https_host, response_media_type, validate_response_size
@@ -37,6 +49,10 @@ class Ar5ivProvider:
         source_repository: SourceRepository | None = None,
         request_cache: RemoteRequestCache | None = None,
         request_gate: HostRequestGate | None = None,
+        max_dependency_count: int = DEFAULT_MAX_DEPENDENCY_COUNT,
+        max_dependency_bytes: int = DEFAULT_MAX_DEPENDENCY_BYTES,
+        max_total_dependency_bytes: int = DEFAULT_MAX_TOTAL_DEPENDENCY_BYTES,
+        max_dependency_redirects: int = DEFAULT_MAX_DEPENDENCY_REDIRECTS,
     ):
         self.client = client or httpx.Client(timeout=timeout, follow_redirects=True)
         self.timeout = timeout
@@ -48,6 +64,11 @@ class Ar5ivProvider:
         self.request_gate = request_gate or shared_host_gate(
             self.cache.root, AR5IV_HOST, minimum_interval=0
         )
+        self.resource_cache = ReferenceMaterialCache(self.cache.root)
+        self.max_dependency_count = max_dependency_count
+        self.max_dependency_bytes = max_dependency_bytes
+        self.max_total_dependency_bytes = max_total_dependency_bytes
+        self.max_dependency_redirects = max_dependency_redirects
 
     def fetch(self, paper_id: str, *, refresh: bool = False) -> SourceArtifact:
         url = ar5iv_url(paper_id)
@@ -68,11 +89,58 @@ class Ar5ivProvider:
             fetch=lambda: self._fetch_html_bytes(url, paper_id),
         )
 
-    def _fetch_html_bytes(self, url: str, paper_id: str) -> bytes:
-        require_https_host(url, AR5IV_HOST)
-        response = self.request_gate.request(
-            lambda: self.client.get(url, timeout=self.timeout)
+    def fetch_bundle(
+        self, paper_id: str, *, refresh: bool = False
+    ) -> HtmlSourceBundle:
+        """Fetch ar5iv HTML plus bounded authored image dependencies."""
+
+        url = ar5iv_url(paper_id)
+        aid = arxiv_path_id(paper_id)
+        origin = SourceOrigin(
+            kind=SourceOriginKind.REMOTE_PROVIDER,
+            provider="ar5iv",
+            locator=url,
+            metadata={"arxiv_id": aid, "document_id": f"arXiv:{aid}"},
         )
+        return fetch_cached_html_bundle(
+            cache=self.cache,
+            resource_cache=self.resource_cache,
+            source_namespace="ar5iv-html",
+            dependency_namespace=AR5IV_HTML_DEPENDENCY_NAMESPACE,
+            request_key=aid,
+            source_origin=origin,
+            provider="ar5iv",
+            allowed_host=AR5IV_HOST,
+            client=self.client,
+            request_gate=self.request_gate,
+            timeout=self.timeout,
+            refresh=refresh,
+            fetch_main=lambda: self._fetch_html_document(url, paper_id),
+            max_dependency_count=self.max_dependency_count,
+            max_dependency_bytes=self.max_dependency_bytes,
+            max_total_dependency_bytes=self.max_total_dependency_bytes,
+            max_redirects=self.max_dependency_redirects,
+        )
+
+    def _fetch_html_bytes(self, url: str, paper_id: str) -> bytes:
+        payload, _url = self._fetch_html_document(url, paper_id)
+        return payload
+
+    def _fetch_html_document(self, url: str, paper_id: str) -> tuple[bytes, str]:
+        require_https_host(url, AR5IV_HOST)
+        try:
+            response = fetch_safe_response(
+                self.client,
+                self.request_gate,
+                url,
+                allowed_hosts=(AR5IV_HOST,),
+                timeout=self.timeout,
+                max_redirects=self.max_dependency_redirects,
+                maximum_bytes=MAX_HTML_BYTES,
+                size_error_code="ar5iv_html_too_large",
+            )
+        except HtmlSourceBundleError as exc:
+            raise ProviderError(exc.code, exc.message) from exc
         if response.status_code == 404:
             raise ProviderError(
                 "ar5iv_not_found", f"ar5iv HTML not found for {paper_id}"
@@ -93,5 +161,13 @@ class Ar5ivProvider:
                 "ar5iv_media_type_invalid",
                 f"ar5iv returned unsupported media type: {media_type or '<missing>'}",
             )
-        return bytes(response.content)
-__all__ = ["AR5IV_MEDIA_TYPE", "Ar5ivProvider", "MAX_HTML_BYTES", "ar5iv_url"]
+        return bytes(response.content), str(response.url)
+
+
+__all__ = [
+    "AR5IV_HTML_DEPENDENCY_NAMESPACE",
+    "AR5IV_MEDIA_TYPE",
+    "Ar5ivProvider",
+    "MAX_HTML_BYTES",
+    "ar5iv_url",
+]

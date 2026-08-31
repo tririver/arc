@@ -305,11 +305,32 @@ def _parser() -> _Parser:
     fetch_commands = {
         "fetch-arxiv-auto": "fetch and cache the best available arXiv source",
         "fetch-arxiv-pdf": "fetch and cache an arXiv PDF",
+        "fetch-arxiv-html-bundle": (
+            "fetch and cache arXiv HTML with authored image dependencies"
+        ),
     }
     for name, summary in fetch_commands.items():
         command = commands.add_parser(name, help=summary, description=summary.capitalize() + ".")
         _paper_arguments(command)
         command.add_argument("--cache-root", help="override the paper cache directory")
+
+    exported_html = commands.add_parser(
+        "export-arxiv-html-bundle",
+        help="export arXiv HTML with safe authored dependency paths",
+        description=(
+            "Fetch the preferred arXiv HTML bundle and materialize it for "
+            "network-free local document parsing."
+        ),
+    )
+    _paper_arguments(exported_html)
+    exported_html.add_argument(
+        "--output-dir",
+        required=True,
+        help="new or empty source-bundle directory",
+    )
+    exported_html.add_argument(
+        "--cache-root", help="override the paper cache directory"
+    )
 
     imported = commands.add_parser(
         "import-source",
@@ -722,10 +743,21 @@ def _parameters(args: argparse.Namespace) -> dict[str, Any]:
             "case_sensitive": args.case_sensitive,
             "cache_root": args.cache_root,
         }
-    if command in {"fetch-arxiv-auto", "fetch-arxiv-pdf"}:
+    if command in {
+        "fetch-arxiv-auto",
+        "fetch-arxiv-pdf",
+        "fetch-arxiv-html-bundle",
+    }:
         return {
             "paper_id": args.paper_id,
             "refresh": args.refresh,
+            "cache_root": args.cache_root,
+        }
+    if command == "export-arxiv-html-bundle":
+        return {
+            "paper_id": args.paper_id,
+            "refresh": args.refresh,
+            "output_dir": args.output_dir,
             "cache_root": args.cache_root,
         }
     if command == "import-source":

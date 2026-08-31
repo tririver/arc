@@ -20,6 +20,7 @@ from ac_document import AcDocumentService
 
 from ._cache_admin import (
     CacheAdministrator,
+    CacheEntry,
     CacheListResult,
     CacheRemoveResult,
     CacheUpdateRecord,
@@ -75,9 +76,23 @@ from .document_search import (
     select_section as _select_section,
     table_of_contents as _table_of_contents,
 )
-from .ids import arxiv_path_id, doi_value, inspire_recid, normalize_paper_id
+from .ids import (
+    arxiv_path_id,
+    arxiv_version,
+    arxiv_version_is_invalid,
+    arxiv_versioned_path_id,
+    doi_value,
+    inspire_recid,
+    normalize_paper_id,
+)
 from .ids import extract_paper_ids as _extract_paper_ids
 from .ids import paper_ids_safe_dir_name as _paper_ids_safe_dir_name
+from .html_dependencies import (
+    AR5IV_HTML_DEPENDENCY_NAMESPACE,
+    ARXIV_HTML_DEPENDENCY_NAMESPACE,
+    HtmlSourceBundle,
+    materialize_html_source_bundle,
+)
 from .providers import (
     Ar5ivProvider,
     ArxivHtmlProvider,
@@ -199,6 +214,51 @@ class ArcPaperService(AcDocumentService):
             paper_id, refresh=refresh
         )
         return source
+
+    def fetch_arxiv_html_bundle(
+        self, paper_id: str, *, refresh: bool = False
+    ) -> HtmlSourceBundle:
+        """Fetch the preferred HTML source and its authored image bundle."""
+
+        if arxiv_version_is_invalid(paper_id):
+            raise ProviderError(
+                "arxiv_version_invalid",
+                "explicit arXiv version must be positive and have no leading zeros",
+            )
+        try:
+            bundle = self.arxiv_html.fetch_bundle(paper_id, refresh=refresh)
+        except ProviderError as exc:
+            if exc.code != "arxiv_html_not_found":
+                raise
+            if arxiv_version(paper_id):
+                raise ProviderError(
+                    "arxiv_html_version_not_found",
+                    "exact versioned arXiv HTML is unavailable; fallback would lose version identity",
+                ) from exc
+            bundle = self.ar5iv.fetch_bundle(paper_id, refresh=refresh)
+        self._record_arxiv_bundle_component(paper_id, bundle)
+        return bundle
+
+    def export_arxiv_html_bundle(
+        self,
+        paper_id: str,
+        *,
+        output_dir: str | Path,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Materialize remote HTML and safe authored targets for local parsing."""
+
+        bundle = self.fetch_arxiv_html_bundle(paper_id, refresh=refresh)
+        provider = self.arxiv_html if bundle.provider == "arxiv-html" else self.ar5iv
+        resource_cache = getattr(provider, "resource_cache", None)
+        if not isinstance(resource_cache, ReferenceMaterialCache):
+            resource_cache = ReferenceMaterialCache(self.cache_root)
+        return materialize_html_source_bundle(
+            bundle,
+            source_repository=self.repository,
+            resource_cache=resource_cache,
+            output_dir=output_dir,
+        )
 
     def fetch_arxiv_pdf(
         self, paper_id: str, *, refresh: bool = False
@@ -572,6 +632,7 @@ class ArcPaperService(AcDocumentService):
                             _cache_error_message(exc),
                         )
                     )
+            bundle_papers = self._cached_html_bundle_paper_ids(entry)
             arxiv_id = (
                 str((metadata or {}).get("arxiv_id") or "")
                 or arxiv_path_id(paper_id)
@@ -581,10 +642,34 @@ class ArcPaperService(AcDocumentService):
                 ("arxiv-auto", self.parse_arxiv_auto),
                 ("arxiv-pdf", self.parse_arxiv_pdf),
             ):
+                if component == "arxiv-auto" and bundle_papers:
+                    for bundle_paper in bundle_papers:
+                        try:
+                            bundle = self.fetch_arxiv_html_bundle(
+                                bundle_paper, refresh=True
+                            )
+                            self.parse_bundle(SourceBundle(primary=bundle.primary))
+                            records.append(
+                                CacheUpdateRecord(
+                                    entry.entry_id, bundle.provider, "updated"
+                                )
+                            )
+                        except Exception as exc:
+                            records.append(
+                                CacheUpdateRecord(
+                                    entry.entry_id,
+                                    "arxiv-auto",
+                                    "failed",
+                                    _cache_error_message(exc),
+                                )
+                            )
+                    continue
                 try:
-                    result = action(arxiv_paper, refresh=True)
                     if component == "arxiv-auto":
+                        result = action(arxiv_paper, refresh=True)
                         component = _auto_html_component(result.report.primary)
+                    else:
+                        action(arxiv_paper, refresh=True)
                     records.append(
                         CacheUpdateRecord(entry.entry_id, component, "updated")
                     )
@@ -1083,6 +1168,59 @@ class ArcPaperService(AcDocumentService):
             kind="source",
             namespace=component,
             request_key=arxiv_path_id(paper_id),
+        )
+
+    def _record_arxiv_bundle_component(
+        self, paper_id: str, bundle: HtmlSourceBundle
+    ) -> None:
+        component = bundle.provider
+        provider = self.arxiv_html if component == "arxiv-html" else self.ar5iv
+        dependency_namespace = (
+            ARXIV_HTML_DEPENDENCY_NAMESPACE
+            if component == "arxiv-html"
+            else AR5IV_HTML_DEPENDENCY_NAMESPACE
+        )
+        request_key = (
+            arxiv_versioned_path_id(paper_id)
+            if component == "arxiv-html"
+            else arxiv_path_id(paper_id)
+        )
+        for kind, namespace in (
+            ("source", component),
+            ("json", dependency_namespace),
+        ):
+            self._record_remote_component(
+                paper_id,
+                component,
+                cache=getattr(provider, "cache", None),
+                kind=kind,
+                namespace=namespace,
+                request_key=request_key,
+            )
+
+    def _cached_html_bundle_paper_ids(
+        self, entry: CacheEntry
+    ) -> tuple[str, ...]:
+        admin_by_id = {
+            item.entry_id: item
+            for item in self.cache_administrator.remote.admin_entries()
+        }
+        request_keys = {
+            admin.request_key
+            for component in entry.components
+            for storage_id in component.storage_entry_ids
+            if (admin := admin_by_id.get(storage_id)) is not None
+            and admin.kind == "json"
+            and admin.namespace
+            in {
+                ARXIV_HTML_DEPENDENCY_NAMESPACE,
+                AR5IV_HTML_DEPENDENCY_NAMESPACE,
+            }
+        }
+        return tuple(
+            f"arXiv:{request_key}"
+            for request_key in sorted(request_keys)
+            if arxiv_path_id(request_key)
         )
 
     def _record_remote_component(
@@ -1762,6 +1900,31 @@ def fetch_arxiv_auto(
     )
 
 
+def fetch_arxiv_html_bundle(
+    paper_id: str,
+    *,
+    cache_root: str | Path | None = None,
+    refresh: bool = False,
+) -> HtmlSourceBundle:
+    return ArcPaperService(cache_root=cache_root).fetch_arxiv_html_bundle(
+        paper_id, refresh=refresh
+    )
+
+
+def export_arxiv_html_bundle(
+    paper_id: str,
+    *,
+    output_dir: str | Path,
+    cache_root: str | Path | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    return ArcPaperService(cache_root=cache_root).export_arxiv_html_bundle(
+        paper_id,
+        output_dir=output_dir,
+        refresh=refresh,
+    )
+
+
 def fetch_arxiv_pdf(
     paper_id: str,
     *,
@@ -1863,10 +2026,12 @@ __all__ = [
     "cache_document",
     "default_cache_root",
     "extract_paper_ids",
+    "export_arxiv_html_bundle",
     "export_cache",
     "export_rich_document",
     "extract_keywords",
     "fetch_arxiv_auto",
+    "fetch_arxiv_html_bundle",
     "fetch_arxiv_pdf",
     "get_abstract",
     "get_authors",

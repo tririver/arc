@@ -1,5 +1,7 @@
 from arc_paper.ids import (
     arxiv_path_id,
+    arxiv_version,
+    arxiv_versioned_path_id,
     doi_value,
     extract_paper_ids,
     inspire_recid,
@@ -7,6 +9,7 @@ from arc_paper.ids import (
     paper_ids_safe_dir_name,
     paper_landing_url,
 )
+from arc_paper import ids as ids_module
 
 
 def test_normalize_new_arxiv_id():
@@ -25,6 +28,36 @@ def test_normalize_old_arxiv_id():
 
 def test_arxiv_path_id_rejects_non_arxiv():
     assert arxiv_path_id("doi:10.1000/example") == ""
+
+
+def test_arxiv_version_preserves_only_explicit_valid_suffixes():
+    assert arxiv_version("arXiv:2512.06790v2") == "v2"
+    assert arxiv_version("hep-th/0601001V12") == "v12"
+    assert arxiv_version("https://arxiv.org/abs/2512.06790v3") == "v3"
+    assert arxiv_version("https://arxiv.org/pdf/2512.06790v4.pdf") == "v4"
+    assert arxiv_version("2512.06790") == ""
+    assert arxiv_version("doi:10.1000/example") == ""
+
+
+def test_arxiv_versioned_path_id_keeps_latest_and_explicit_keys_distinct():
+    assert arxiv_versioned_path_id("2512.06790") == "2512.06790"
+    assert arxiv_versioned_path_id("arXiv:2512.06790v2") == "2512.06790v2"
+    assert (
+        arxiv_versioned_path_id("https://arxiv.org/abs/hep-th/0601001v3")
+        == "hep-th/0601001v3"
+    )
+    assert arxiv_versioned_path_id("doi:10.1000/example") == ""
+
+
+def test_invalid_explicit_arxiv_versions_are_not_latest_identities():
+    for identifier in (
+        "arXiv:2512.06790v0",
+        "2512.06790v01",
+        "https://arxiv.org/abs/2512.06790v0",
+    ):
+        assert ids_module.arxiv_version_is_invalid(identifier) is True
+        assert arxiv_version(identifier) == ""
+        assert arxiv_versioned_path_id(identifier) == ""
 
 
 def test_arxiv_path_id_rejects_invalid_arxiv_like_ids():

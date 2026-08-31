@@ -34,8 +34,25 @@ Replace the quoted placeholder with an arXiv, INSPIRE, or DOI identifier.
 Use `arc-paper --help` and `arc-paper get-metadata --help` for the current
 paper, source, search, workflow, and cache commands.
 
-Provider-neutral export belongs to `ac-document`; use its output for direct
-`alc-render` composition:
+Remote arXiv HTML is not necessarily a single file. Materialize the primary
+HTML with its safe authored SVG and image targets before local document export:
+
+```bash
+arc-paper export-arxiv-html-bundle arXiv:0911.3380 \
+  --output-dir ./paper-source \
+  --cache-root ./.arc/cache/arc-paper
+
+ac-document export-rich-document ./paper-source/source.html \
+  --output-dir ./render-input \
+  --cache-root ./.ac/cache/ac-document
+```
+
+The first command writes exact `source.html`, a versioned `manifest.json`, and
+verified resources at safe authored relative paths. The second command remains
+provider-neutral and network-free. Released `ac-document` 2.0.1 consumes
+`img[src]` resources but does not yet admit `object[data]` SVG files as
+RichDocument assets; that downstream handoff requires a later ac-document
+release. Use a compatible exporter output for direct `alc-render` composition:
 
 ```bash
 ac-document export-rich-document ./note.md \
@@ -55,6 +72,69 @@ alc-render render \
 PDF `--validator`. It refuses a nonempty output directory, copies verified
 assets below `resources/`, and returns the source and metadata paths at
 `data.source` and `data.metadata`.
+
+### HTML dependency bundle contract
+
+`fetch-arxiv-auto` and reference acquisition keep their existing single-file
+behavior. Dependency downloads are explicit through
+`fetch-arxiv-html-bundle` or `export-arxiv-html-bundle`; this prevents an old
+caller from unexpectedly turning one provider request into many. Official
+arXiv HTML falls back to ar5iv only when the official HTML endpoint returns a
+deterministic 404 for an unversioned/latest request.
+
+An explicit arXiv revision such as `arXiv:2608.20415v1` is an exact bundle
+identity. The official request and source/dependency cache keys retain `v1`,
+and the final document URL plus authored revision signals must agree with that
+version. The accepted authored signals are an exact versioned HTML base root
+or the paired official abstract/PDF header links. Missing or conflicting
+signals fail closed. An exact-version 404 is not retried through unversioned
+ar5iv. Unversioned IDs keep the existing latest/canonical behavior, and the
+legacy single-file `fetch-arxiv-auto` path is unchanged.
+
+Bundle schema `arc.paper.html_source_bundle.v2` records the primary source,
+validated final document URL, effective authored base URL, canonical bundle
+digest, exact acquisition policy, ordered dependency records, and structured
+warnings. Each record keeps
+the authored element/attribute/target, request and final response URLs,
+declared and response media types, SHA-256 digest, byte size, availability, and
+typed failure provenance. One failed dependency never discards a valid primary
+HTML response or fabricates a resource.
+
+Extraction uses the LaTeXML `article.ltx_document` root when present and
+otherwise the full document. Version 1 supports `object[data]`, `img[src]`, and
+`source[src]`; `img/source[srcset]` is retained as an explicit unsupported
+warning because browser candidate selection is not represented by this schema.
+Only credential-free HTTPS URLs on the provider's own host and default port are
+requested. Authored fragments, unsafe schemes, cross-host bases, and cross-host
+redirects are rejected before the next request. Every redirect hop is checked.
+
+The defaults are 256 dependency records, 25 MiB per unique resource, 200 MiB
+total unique bytes, and five redirects. Supported media are external SVG, PNG,
+JPEG, GIF, WebP, and AVIF with declared type, filename extension, and response
+`Content-Type` agreement. SVG bytes are preserved as external files; ARC does
+not execute, sanitize, or inline them.
+
+Bundle metadata uses separate digest-verified remote JSON cache entries named
+`arxiv-html-dependencies` and `ar5iv-html-dependencies`; primary HTML retains
+the existing source cache format. The first explicit bundle request against an
+older main-only cache refetches the primary once because the old mapping does
+not contain a verified final response URL. Replay validates the current primary
+and every resource, and requires the exact same count, per-resource byte,
+document byte, and redirect limits. Schema v1 sidecars did not record these
+limits and are therefore reacquired rather than replayed. Refresh and
+corrupt-resource repair use the existing
+cooperating-process leases and atomic manifests. Cache archive export includes
+all reachable bundle resources. Removal drops mappings, but shared resource
+blobs are retained because no reference-counted garbage-collection contract
+exists.
+
+Only safe scheme-less authored relative targets are materialized beside
+`source.html`; absolute and traversing targets remain structured warnings.
+Importing or exporting an ordinary local HTML file never invokes a provider.
+An unversioned schema v2 bundle cannot be relabeled as an explicit revision:
+its URL, origin metadata, cache key, policy, and bundle digest bind the original
+provenance. Schema v1 bundles lack policy identity and are not replayed by the
+v2 codec; reacquire instead of editing their cache or manifest.
 
 ## Cache portability
 
@@ -144,6 +224,31 @@ print(metadata.get("title", ""))
 
 Repository-backed parsing and LLM-backed workflows are also available through
 their public package facades.
+
+### Remote HTML source bundles
+
+```python
+from arc_paper import ArcPaperService
+
+papers = ArcPaperService(cache_root="./.arc/cache/arc-paper")
+bundle = papers.fetch_arxiv_html_bundle("arXiv:0911.3380")
+available = [
+    dependency
+    for dependency in bundle.dependencies
+    if dependency.availability == "available"
+]
+result = papers.export_arxiv_html_bundle(
+    "arXiv:0911.3380",
+    output_dir="./paper-source",
+)
+```
+
+`HtmlSourceBundle`, `HtmlDependency`, `HtmlDependencyWarning`, their document
+codecs, and the standalone fetch/export functions are public. Pass the exported
+`source.html` to a compatible `ac-document`; do not make `ac-document`
+responsible for network acquisition. Version 2.0.1 does not yet consume
+`object[data]` SVG resources, so full object-panel asset handoff remains blocked
+until that support is released.
 
 ### Reference material cache
 

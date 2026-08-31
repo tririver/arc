@@ -22,6 +22,7 @@ from arc_paper.providers import (
 )
 from arc_paper.providers.ar5iv import MAX_HTML_BYTES
 from arc_paper.providers._request_gate import HostRequestGate
+from arc_paper.providers.base import ProviderError
 from arc_paper.providers.arxiv_html import arxiv_html_url
 from arc_paper.providers.arxiv_pdf import arxiv_pdf_url
 from arc_paper.source_repository import SourceRepository
@@ -34,12 +35,13 @@ def _response(
     content: bytes,
     media_type: str,
     status_code: int = 200,
+    headers: dict[str, str] | None = None,
 ) -> httpx.Response:
     return httpx.Response(
         status_code,
         request=request,
         content=content,
-        headers={"content-type": media_type},
+        headers={"content-type": media_type, **(headers or {})},
     )
 
 
@@ -126,6 +128,254 @@ def test_official_arxiv_html_fetches_directly_and_replays_from_cache(tmp_path):
     }
     assert replay.origin.metadata == first.origin.metadata
     assert calls == ["https://arxiv.org/html/0911.3380"]
+
+
+def _versioned_official_html(
+    aid: str,
+    version: str,
+    body: str = '<article class="ltx_document"></article>',
+    *,
+    base: str = "",
+) -> bytes:
+    base_tag = f'<base href="{base}">' if base else ""
+    return (
+        f"<html><head>{base_tag}</head><body>"
+        '<nav class="html-header-nav">'
+        '<a class="header-button" title="Back to abstract page" '
+        f'aria-label="Back to abstract page" href="/abs/{aid}{version}">Back</a>'
+        '<a class="header-button" title="Download PDF" '
+        f'href="/pdf/{aid}{version}" target="_blank">PDF</a>'
+        f"</nav>{body}</body></html>"
+    ).encode()
+
+
+def test_official_bundle_preserves_explicit_version_url_key_and_codec(tmp_path):
+    from arc_paper import (
+        html_source_bundle_from_document,
+        html_source_bundle_to_document,
+    )
+    from arc_paper.providers.arxiv_html import arxiv_html_bundle_url
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        calls.append(url)
+        if url == "https://arxiv.org/html/2608.20415v1":
+            return _response(
+                request,
+                content=_versioned_official_html(
+                    "2608.20415",
+                    "v1",
+                    '<article class="ltx_document"><img src="2608.20415v1/panel.png"></article>',
+                ),
+                media_type="text/html",
+            )
+        if url == "https://arxiv.org/html/2608.20415v1/panel.png":
+            return _response(request, content=b"png-v1", media_type="image/png")
+        raise AssertionError(url)
+
+    provider = ArxivHtmlProvider(
+        cache_root=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        request_gate=HostRequestGate(minimum_interval=0),
+    )
+    bundle = provider.fetch_bundle("arXiv:2608.20415v1")
+    service = ArcPaperService(cache_root=tmp_path, arxiv_html=provider)
+    service_bundle = service.fetch_arxiv_html_bundle("arXiv:2608.20415v1")
+
+    assert arxiv_html_bundle_url("arXiv:2608.20415v1") == (
+        "https://arxiv.org/html/2608.20415v1"
+    )
+    assert bundle.document_url == "https://arxiv.org/html/2608.20415v1"
+    assert bundle.base_url == bundle.document_url
+    assert bundle.primary.origin.locator == bundle.document_url
+    assert bundle.primary.origin.metadata == {
+        "arxiv_id": "2608.20415",
+        "arxiv_version": "v1",
+        "document_id": "arXiv:2608.20415v1",
+    }
+    assert html_source_bundle_from_document(
+        html_source_bundle_to_document(bundle)
+    ) == bundle
+    assert service_bundle.bundle_digest == bundle.bundle_digest
+    listed = service.list_cache(paper_ids=("2608.20415",)).entries[0]
+    component = next(item for item in listed.components if item.name == "arxiv-html")
+    assert len(component.storage_entry_ids) == 2
+    assert {
+        item.request_key
+        for item in provider.cache.admin_entries()
+        if item.namespace in {"arxiv-html", "arxiv-html-dependencies"}
+    } == {"2608.20415v1"}
+    assert calls == [
+        "https://arxiv.org/html/2608.20415v1",
+        "https://arxiv.org/html/2608.20415v1/panel.png",
+    ]
+
+
+def test_exact_version_bundle_does_not_fall_back_to_unversioned_ar5iv(tmp_path):
+    class MissingOfficial:
+        def fetch_bundle(self, paper_id: str, *, refresh: bool = False):
+            raise ProviderError("arxiv_html_not_found", "missing")
+
+    class ForbiddenFallback:
+        def fetch_bundle(self, paper_id: str, *, refresh: bool = False):
+            raise AssertionError("exact version must not use an unversioned fallback")
+
+    service = ArcPaperService(
+        cache_root=tmp_path,
+        arxiv_html=MissingOfficial(),  # type: ignore[arg-type]
+        ar5iv=ForbiddenFallback(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ProviderError) as error:
+        service.fetch_arxiv_html_bundle("arXiv:2608.20415v1")
+
+    assert error.value.code == "arxiv_html_version_not_found"
+
+
+@pytest.mark.parametrize(
+    "paper_id",
+    ("arXiv:2608.20415v0", "2608.20415v01"),
+)
+def test_bundle_service_rejects_invalid_explicit_version_before_providers(
+    tmp_path,
+    paper_id: str,
+):
+    class ForbiddenProvider:
+        def fetch_bundle(self, paper_id: str, *, refresh: bool = False):
+            raise AssertionError("invalid explicit version must fail before provider access")
+
+    service = ArcPaperService(
+        cache_root=tmp_path,
+        arxiv_html=ForbiddenProvider(),  # type: ignore[arg-type]
+        ar5iv=ForbiddenProvider(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ProviderError) as error:
+        service.fetch_arxiv_html_bundle(paper_id)
+
+    assert error.value.code == "arxiv_version_invalid"
+
+
+def test_official_bundle_separates_latest_and_explicit_version_cache_keys(
+    tmp_path,
+):
+    calls: list[str] = []
+    versions = {
+        "https://arxiv.org/html/2608.20415": "v3",
+        "https://arxiv.org/html/2608.20415v1": "v1",
+        "https://arxiv.org/html/2608.20415v2": "v2",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        calls.append(url)
+        version = versions.get(url)
+        if version is not None:
+            return _response(
+                request,
+                content=_versioned_official_html("2608.20415", version),
+                media_type="text/html",
+            )
+        raise AssertionError(url)
+
+    provider = ArxivHtmlProvider(
+        cache_root=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        request_gate=HostRequestGate(minimum_interval=0),
+    )
+    latest = provider.fetch_bundle("2608.20415")
+    v1 = provider.fetch_bundle("2608.20415v1")
+    v2 = provider.fetch_bundle("arXiv:2608.20415v2")
+    replay = ArxivHtmlProvider(
+        cache_root=tmp_path,
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(
+                    AssertionError("versioned bundle replay must not access HTTP")
+                )
+            )
+        ),
+        request_gate=HostRequestGate(minimum_interval=0),
+    ).fetch_bundle("2608.20415v1")
+
+    assert latest.primary.origin.metadata["arxiv_version"] == "v3"
+    assert latest.primary.origin.metadata["document_id"] == "arXiv:2608.20415"
+    assert v1.primary.origin.metadata["arxiv_version"] == "v1"
+    assert v2.primary.origin.metadata["arxiv_version"] == "v2"
+    assert replay.bundle_digest == v1.bundle_digest
+    assert {
+        item.request_key
+        for item in provider.cache.admin_entries()
+        if item.namespace in {"arxiv-html", "arxiv-html-dependencies"}
+    } == {"2608.20415", "2608.20415v1", "2608.20415v2"}
+    assert calls == list(versions)
+
+
+@pytest.mark.parametrize(
+    ("response_url", "payload", "code"),
+    (
+        (
+            "https://arxiv.org/html/2608.20415v1",
+            _versioned_official_html("2608.20415", "v2"),
+            "arxiv_html_revision_mismatch",
+        ),
+        (
+            "https://arxiv.org/html/2608.20415v1",
+            b'<html><article class="ltx_document"></article></html>',
+            "arxiv_html_revision_unverified",
+        ),
+        (
+            "https://arxiv.org/html/2608.20415v2",
+            _versioned_official_html("2608.20415", "v2"),
+            "arxiv_html_revision_mismatch",
+        ),
+        (
+            "https://arxiv.org/html/2608.20415v1",
+            _versioned_official_html(
+                "2608.20415",
+                "v1",
+                base="/html/2608.20415v2/",
+            ),
+            "arxiv_html_revision_mismatch",
+        ),
+    ),
+)
+def test_official_bundle_fails_closed_on_revision_mismatch_or_absence(
+    tmp_path,
+    response_url: str,
+    payload: bytes,
+    code: str,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://arxiv.org/html/2608.20415v1":
+            if response_url != str(request.url):
+                return _response(
+                    request,
+                    status_code=302,
+                    content=b"",
+                    media_type="text/html",
+                    headers={"location": response_url},
+                )
+            return _response(request, content=payload, media_type="text/html")
+        if str(request.url) == response_url:
+            return _response(request, content=payload, media_type="text/html")
+        raise AssertionError(str(request.url))
+
+    provider = ArxivHtmlProvider(
+        cache_root=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        request_gate=HostRequestGate(minimum_interval=0),
+    )
+
+    with pytest.raises(ProviderError) as error:
+        provider.fetch_bundle("arXiv:2608.20415v1")
+
+    assert error.value.code == code
+    assert provider.cache.admin_entry(
+        "source", "arxiv-html", "2608.20415v1"
+    ) is None
 
 
 @pytest.mark.parametrize(

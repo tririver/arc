@@ -271,6 +271,65 @@ arc-paper materialize-reference \
 acquisition or admission, keep the returned identity and resource objects;
 `materialize-reference` requires one complete `CachedResourceRef` object.
 
+## Acquire Remote HTML Dependencies
+
+Remote arXiv HTML may reference authored SVG and image files. Use the explicit
+bundle command before local parsing when figure fidelity matters:
+
+```bash
+arc-paper export-arxiv-html-bundle <arxiv-id> \
+  --output-dir <new-or-empty-source-directory> \
+  --cache-root <paper-cache-root>
+
+ac-document export-rich-document \
+  <new-or-empty-source-directory>/source.html \
+  --output-dir <rich-document-workspace> \
+  --cache-root <document-cache-root>
+```
+
+The ARC bundle itself preserves both `img[src]` and `object[data]` authored
+files. Released `ac-document` 2.0.1 does not yet admit `object[data]` SVG files
+as RichDocument assets, so use this handoff for object panels only after a
+compatible ac-document release. Do not add network acquisition to ac-document
+or substitute another parser inside ARC.
+
+Inspect `data.manifest`, `data.resources[]`, and `data.warnings[]`. The source
+bundle preserves the exact primary HTML and writes verified resources only at
+safe authored relative paths. A dependency warning means partial availability;
+it does not invalidate a valid primary source. SVG is stored as an external
+file and is never executed or inlined by acquisition.
+
+The bundle follows same-origin HTTPS only, validates every redirect, rejects
+credentials/fragments/unsafe schemes, and enforces bounded counts and bytes.
+It supports `object[data]`, `img[src]`, and `source[src]`; `srcset` remains an
+explicit unsupported warning. `--refresh` refreshes the primary and bundle.
+Without it, verified cache replay performs no HTTP request. A first bundle
+request may refetch an older main-only cache entry to obtain missing final-URL
+provenance. Replay also requires the exact same dependency count, per-resource
+byte, document-byte, and redirect limits; older schema v1 sidecars lack that
+policy identity and are reacquired.
+
+`fetch-arxiv-auto`, `acquire-reference`, and ordinary local HTML parsing remain
+single-file compatible. Local input never triggers dependency downloads. Use
+`fetch-arxiv-html-bundle` when the cached manifest is needed without writing an
+export directory. Cache archive selection includes reachable bundle resources;
+cache removal retains shared content blobs rather than deleting possibly reused
+bytes.
+
+Treat an input ending in `vN` as an exact official-bundle identity. ARC keeps
+that suffix in the official request, source/dependency cache keys, final URL,
+and origin metadata. The final URL and strict authored revision signals (an
+exact versioned HTML base root or paired official abstract/PDF header links)
+must agree; absence or conflict fails closed. An exact-version 404 never falls
+back to unversioned ar5iv. Inputs without `vN` retain latest/canonical fallback
+behavior, and the legacy single-file commands remain unchanged.
+
+Do not edit an unversioned schema v2 manifest or cache entry to add `vN`. Its
+document URL, origin, key, policy, and digest bind the recorded provenance.
+Schema v1 bundles lack policy identity and are not replayed by the v2 codec;
+perform a new acquisition when either exact version or v2 policy provenance is
+required.
+
 ## Parse a Local Source
 
 Use one HTML, Markdown, flattened TeX, or PDF as the authoritative primary. A

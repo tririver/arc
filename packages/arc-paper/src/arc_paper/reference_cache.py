@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -188,27 +189,25 @@ class ReferenceMaterialCache:
         payload_path = object_dir / "resource"
         with file_lease(self._resource_lock(digest), blocking=True):
             if manifest_path.exists():
-                size, media_types = self._read_resource_object(digest)
+                try:
+                    size, media_types = self._read_resource_object(digest)
+                except ReferenceCacheError as exc:
+                    if exc.code not in {
+                        "reference_resource_corrupt",
+                        "reference_resource_manifest_invalid",
+                    }:
+                        raise
+                    if object_dir.is_symlink():
+                        raise
+                    shutil.rmtree(object_dir)
+                    size, media_types = -1, frozenset()
                 if size != len(payload):
-                    raise ReferenceCacheError(
-                        "reference_resource_mismatch",
-                        "cached resource size conflicts with admitted bytes",
-                    )
-                if normalized_media not in media_types:
-                    atomic_write_bytes(
-                        manifest_path,
-                        _json_bytes(
-                            {
-                                "schema_version": REFERENCE_RESOURCE_OBJECT_SCHEMA,
-                                "resource_sha256": digest,
-                                "resource_size": len(payload),
-                                "media_types": sorted(
-                                    {*media_types, normalized_media}
-                                ),
-                            }
-                        ),
-                    )
-            else:
+                    if size >= 0:
+                        raise ReferenceCacheError(
+                            "reference_resource_mismatch",
+                            "cached resource size conflicts with admitted bytes",
+                        )
+            if not manifest_path.exists():
                 object_dir.mkdir(parents=True, exist_ok=True)
                 if not file_matches_sha256(payload_path, digest, len(payload)):
                     atomic_write_bytes(payload_path, payload)
@@ -220,6 +219,20 @@ class ReferenceMaterialCache:
                             "resource_sha256": digest,
                             "resource_size": len(payload),
                             "media_types": [normalized_media],
+                        }
+                    ),
+                )
+            elif normalized_media not in media_types:
+                atomic_write_bytes(
+                    manifest_path,
+                    _json_bytes(
+                        {
+                            "schema_version": REFERENCE_RESOURCE_OBJECT_SCHEMA,
+                            "resource_sha256": digest,
+                            "resource_size": len(payload),
+                            "media_types": sorted(
+                                {*media_types, normalized_media}
+                            ),
                         }
                     ),
                 )
