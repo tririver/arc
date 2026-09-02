@@ -100,6 +100,13 @@ declared and response media types, SHA-256 digest, byte size, availability, and
 typed failure provenance. One failed dependency never discards a valid primary
 HTML response or fabricates a resource.
 
+`export-arxiv-html-acquisition` is the separate ALC handoff path. It writes a
+strict `ac.document.html_source_export.v1` manifest from ARC's internal ACF
+sidecar and may rewrite an available absolute target to a safe local asset
+path. `export-arxiv-html-bundle` remains the v2-compatible export: it preserves
+the primary bytes and leaves non-relative targets as warnings. Older v2-only
+caches use the handoff fallback only with an explicit sidecar-missing warning.
+
 Extraction uses the LaTeXML `article.ltx_document` root when present and
 otherwise the full document. Version 1 supports `object[data]`, `img[src]`, and
 `source[src]`; `img/source[srcset]` is retained as an explicit unsupported
@@ -244,11 +251,10 @@ result = papers.export_arxiv_html_bundle(
 ```
 
 `HtmlSourceBundle`, `HtmlDependency`, `HtmlDependencyWarning`, their document
-codecs, and the standalone fetch/export functions are public. Pass the exported
-`source.html` to a compatible `ac-document`; do not make `ac-document`
-responsible for network acquisition. Version 2.0.1 does not yet consume
-`object[data]` SVG resources, so full object-panel asset handoff remains blocked
-until that support is released.
+codecs, and the standalone fetch/export functions are public. Ordinary local
+`ac-document` parsing remains network-free. Explicit web acquisition belongs to
+ACF's dedicated API and ARC adapts it only after paper-provider identity and
+revision validation.
 
 ### Reference material cache
 

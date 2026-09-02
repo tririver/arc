@@ -332,6 +332,24 @@ def _parser() -> _Parser:
         "--cache-root", help="override the paper cache directory"
     )
 
+    acquired_html = commands.add_parser(
+        "export-arxiv-html-acquisition",
+        help="export a strict ACF HTML acquisition bundle for ALC",
+        description=(
+            "Materialize the strict AC Foundation HTML acquisition sidecar for "
+            "network-free ALC handoff."
+        ),
+    )
+    _paper_arguments(acquired_html)
+    acquired_html.add_argument(
+        "--output-dir",
+        required=True,
+        help="new or empty HTML acquisition directory",
+    )
+    acquired_html.add_argument(
+        "--cache-root", help="override the paper cache directory"
+    )
+
     imported = commands.add_parser(
         "import-source",
         help="import a local source into the content-addressed cache",
@@ -753,7 +771,7 @@ def _parameters(args: argparse.Namespace) -> dict[str, Any]:
             "refresh": args.refresh,
             "cache_root": args.cache_root,
         }
-    if command == "export-arxiv-html-bundle":
+    if command in {"export-arxiv-html-bundle", "export-arxiv-html-acquisition"}:
         return {
             "paper_id": args.paper_id,
             "refresh": args.refresh,

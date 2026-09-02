@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 import pytest
 
+from arc_paper.html_acquisition import HttpxRequestGateTransport
 from arc_paper import ArcPaperService
 from arc_paper.providers import (
     Ar5ivProvider,
@@ -102,6 +103,10 @@ def test_official_arxiv_html_fetches_directly_and_replays_from_cache(tmp_path):
         cache_root=tmp_path,
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         request_gate=HostRequestGate(minimum_interval=0),
+        dependency_resolver=lambda _host: ("8.8.8.8",),
+        dependency_transport_factory=lambda client, request_gate: HttpxRequestGateTransport(
+            client, request_gate
+        ),
     )
     first = provider.fetch("arXiv:0911.3380v2")
     replay = ArxivHtmlProvider(
@@ -179,6 +184,10 @@ def test_official_bundle_preserves_explicit_version_url_key_and_codec(tmp_path):
         cache_root=tmp_path,
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         request_gate=HostRequestGate(minimum_interval=0),
+        dependency_resolver=lambda _host: ("8.8.8.8",),
+        dependency_transport_factory=lambda client, request_gate: HttpxRequestGateTransport(
+            client, request_gate
+        ),
     )
     bundle = provider.fetch_bundle("arXiv:2608.20415v1")
     service = ArcPaperService(cache_root=tmp_path, arxiv_html=provider)
@@ -201,7 +210,7 @@ def test_official_bundle_preserves_explicit_version_url_key_and_codec(tmp_path):
     assert service_bundle.bundle_digest == bundle.bundle_digest
     listed = service.list_cache(paper_ids=("2608.20415",)).entries[0]
     component = next(item for item in listed.components if item.name == "arxiv-html")
-    assert len(component.storage_entry_ids) == 2
+    assert len(component.storage_entry_ids) == 3
     assert {
         item.request_key
         for item in provider.cache.admin_entries()
@@ -284,6 +293,10 @@ def test_official_bundle_separates_latest_and_explicit_version_cache_keys(
         cache_root=tmp_path,
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         request_gate=HostRequestGate(minimum_interval=0),
+        dependency_resolver=lambda _host: ("8.8.8.8",),
+        dependency_transport_factory=lambda client, request_gate: HttpxRequestGateTransport(
+            client, request_gate
+        ),
     )
     latest = provider.fetch_bundle("2608.20415")
     v1 = provider.fetch_bundle("2608.20415v1")

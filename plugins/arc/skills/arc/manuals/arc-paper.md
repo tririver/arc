@@ -287,11 +287,11 @@ ac-document export-rich-document \
   --cache-root <document-cache-root>
 ```
 
-The ARC bundle itself preserves both `img[src]` and `object[data]` authored
-files. Released `ac-document` 2.0.1 does not yet admit `object[data]` SVG files
-as RichDocument assets, so use this handoff for object panels only after a
-compatible ac-document release. Do not add network acquisition to ac-document
-or substitute another parser inside ARC.
+The legacy ARC bundle preserves both `img[src]` and `object[data]` authored
+files. Explicit ACF acquisition is available through ARC's
+`export-arxiv-html-acquisition` handoff, which writes a strict
+`ac.document.html_source_export.v1` manifest. Local parse/import/export remain
+network-free; ARC still owns paper identity and provider routing.
 
 Inspect `data.manifest`, `data.resources[]`, and `data.warnings[]`. The source
 bundle preserves the exact primary HTML and writes verified resources only at

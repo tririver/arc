@@ -217,6 +217,26 @@ _HTML_BUNDLE_EXPORT_SCHEMA = _object(
     },
     required=("source", "manifest", "bundle_digest", "resources", "warnings"),
 )
+_HTML_ACQUISITION_EXPORT_SCHEMA = _object(
+    {
+        "source": _NONEMPTY_STRING,
+        "manifest": _NONEMPTY_STRING,
+        "bundle_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "resources": {"type": "array", "items": _NONEMPTY_STRING},
+        "warnings": {"type": "array", "items": {"type": "object"}},
+        "export": {"type": "object"},
+        "sidecar_status": {"enum": ["replayed", "legacy_fallback"]},
+    },
+    required=(
+        "source",
+        "manifest",
+        "bundle_digest",
+        "resources",
+        "warnings",
+        "export",
+        "sidecar_status",
+    ),
+)
 _IDENTIFIERS_SCHEMA = {
     "type": "object",
     "additionalProperties": {"type": "string"},
@@ -1588,6 +1608,27 @@ _OPERATIONS = (
         ),
         service.export_arxiv_html_bundle,
         output_schema=_HTML_BUNDLE_EXPORT_SCHEMA,
+        effects=frozenset(
+            {
+                OperationEffect.NETWORK,
+                OperationEffect.CACHE_WRITE,
+                OperationEffect.ARBITRARY_LOCAL_PATH,
+            }
+        ),
+    ),
+    _spec(
+        "export-arxiv-html-acquisition",
+        _object(
+            {
+                **_PAPER,
+                **_REFRESH,
+                "output_dir": _NONEMPTY_STRING,
+                "cache_root": {"type": ["string", "null"]},
+            },
+            required=("paper_id", "output_dir"),
+        ),
+        service.export_arxiv_html_acquisition,
+        output_schema=_HTML_ACQUISITION_EXPORT_SCHEMA,
         effects=frozenset(
             {
                 OperationEffect.NETWORK,

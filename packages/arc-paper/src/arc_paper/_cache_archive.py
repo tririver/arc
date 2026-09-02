@@ -19,11 +19,13 @@ from ac_jobs import canonical_json_bytes as _canonical_json_bytes
 from ._cache_admin import CACHE_INDEX_SCHEMA, CacheAdministrator, CacheEntry
 from ._cache_root import resolve_cache_root
 from .html_dependencies import (
+    AR5IV_HTML_ACQUISITION_NAMESPACE,
     AR5IV_HTML_DEPENDENCY_NAMESPACE,
+    ARXIV_HTML_ACQUISITION_NAMESPACE,
     ARXIV_HTML_DEPENDENCY_NAMESPACE,
     bundle_resource_identities,
 )
-from .reference_cache import ReferenceMaterialCache
+from .reference_cache import CachedResourceRef, ReferenceMaterialCache
 from ac_jobs import file_matches_sha256
 from .source_repository import SourceRepository
 from .sources import SourceFormat
@@ -330,6 +332,48 @@ def _add_remote_entry(root: Path, entry_id: str, paths: set[str]) -> None:
                 raise CacheArchiveError(
                     "cache_archive_dependency_corrupt",
                     f"HTML dependency bundle is invalid: {entry_id}",
+                ) from exc
+            for reference in references:
+                _add_reference_resource(root, reference, paths)
+        if namespace in {
+            ARXIV_HTML_ACQUISITION_NAMESPACE,
+            AR5IV_HTML_ACQUISITION_NAMESPACE,
+        }:
+            try:
+                from .html_acquisition import (
+                    html_acquisition_sidecar_from_document,
+                )
+
+                payload = json.loads(
+                    (directory / payload_name).read_text(encoding="utf-8")
+                )
+                request_key = _read_json_object(admin_path).get("request_key")
+                if not isinstance(request_key, str):
+                    raise ValueError("HTML acquisition sidecar request key is invalid")
+                bundle = html_acquisition_sidecar_from_document(
+                    payload,
+                    request_key=request_key,
+                )
+                references = tuple(
+                    CachedResourceRef(
+                        resource_sha256=item.artifact_digest,
+                        resource_size=item.size,
+                        media_type=item.media_type,
+                    )
+                    for item in bundle.dependencies
+                    if item.availability == "available"
+                )
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise CacheArchiveError(
+                    "cache_archive_dependency_corrupt",
+                    f"HTML acquisition sidecar is invalid: {entry_id}",
                 ) from exc
             for reference in references:
                 _add_reference_resource(root, reference, paths)

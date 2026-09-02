@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 from ..html_dependencies import (
+    AR5IV_HTML_ACQUISITION_NAMESPACE,
     AR5IV_HTML_DEPENDENCY_NAMESPACE,
     DEFAULT_MAX_DEPENDENCY_BYTES,
     DEFAULT_MAX_DEPENDENCY_COUNT,
     DEFAULT_MAX_DEPENDENCY_REDIRECTS,
     DEFAULT_MAX_TOTAL_DEPENDENCY_BYTES,
+    HtmlDependencyAcquirer,
     HtmlSourceBundle,
     HtmlSourceBundleError,
+    acquire_html_dependencies,
     fetch_cached_html_bundle,
     fetch_safe_response,
 )
@@ -49,6 +54,9 @@ class Ar5ivProvider:
         source_repository: SourceRepository | None = None,
         request_cache: RemoteRequestCache | None = None,
         request_gate: HostRequestGate | None = None,
+        dependency_acquirer: HtmlDependencyAcquirer = acquire_html_dependencies,
+        dependency_resolver: Callable[[str], Sequence[str]] | None = None,
+        dependency_transport_factory: Callable[[httpx.Client, Any], Any] | None = None,
         max_dependency_count: int = DEFAULT_MAX_DEPENDENCY_COUNT,
         max_dependency_bytes: int = DEFAULT_MAX_DEPENDENCY_BYTES,
         max_total_dependency_bytes: int = DEFAULT_MAX_TOTAL_DEPENDENCY_BYTES,
@@ -65,6 +73,9 @@ class Ar5ivProvider:
             self.cache.root, AR5IV_HOST, minimum_interval=0
         )
         self.resource_cache = ReferenceMaterialCache(self.cache.root)
+        self.dependency_acquirer = dependency_acquirer
+        self.dependency_resolver = dependency_resolver
+        self.dependency_transport_factory = dependency_transport_factory
         self.max_dependency_count = max_dependency_count
         self.max_dependency_bytes = max_dependency_bytes
         self.max_total_dependency_bytes = max_total_dependency_bytes
@@ -116,6 +127,11 @@ class Ar5ivProvider:
             timeout=self.timeout,
             refresh=refresh,
             fetch_main=lambda: self._fetch_html_document(url, paper_id),
+            dependency_acquirer=self.dependency_acquirer,
+            sidecar_namespace=AR5IV_HTML_ACQUISITION_NAMESPACE,
+            requested_url=url,
+            dependency_resolver=self.dependency_resolver,
+            dependency_transport_factory=self.dependency_transport_factory,
             max_dependency_count=self.max_dependency_count,
             max_dependency_bytes=self.max_dependency_bytes,
             max_total_dependency_bytes=self.max_total_dependency_bytes,

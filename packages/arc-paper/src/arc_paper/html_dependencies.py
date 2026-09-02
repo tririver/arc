@@ -9,12 +9,11 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 from ac_jobs import atomic_write_bytes
-from bs4 import BeautifulSoup
 
 from .reference_cache import (
     CachedResourceRef,
@@ -28,6 +27,8 @@ HTML_SOURCE_BUNDLE_SCHEMA = "arc.paper.html_source_bundle.v2"
 HTML_SOURCE_EXPORT_SCHEMA = "arc.paper.html_source_export.v1"
 ARXIV_HTML_DEPENDENCY_NAMESPACE = "arxiv-html-dependencies"
 AR5IV_HTML_DEPENDENCY_NAMESPACE = "ar5iv-html-dependencies"
+ARXIV_HTML_ACQUISITION_NAMESPACE = "arxiv-html-acquisition"
+AR5IV_HTML_ACQUISITION_NAMESPACE = "ar5iv-html-acquisition"
 
 DEFAULT_MAX_DEPENDENCY_COUNT = 256
 DEFAULT_MAX_DEPENDENCY_BYTES = 25 * 1024 * 1024
@@ -289,30 +290,38 @@ class HtmlSourceBundle:
         )
 
 
-@dataclass(frozen=True)
-class _Candidate:
-    ordinal: int
-    element: str
-    attribute: str
-    authored_target: str
-    declared_media_type: str
+class HtmlDependencyAcquirer(Protocol):
+    """Acquire authored dependencies for an ARC-validated HTML primary."""
+
+    def __call__(
+        self,
+        payload: bytes,
+        *,
+        primary: SourceArtifact,
+        provider: str,
+        document_url: str,
+        requested_url: str | None,
+        allowed_host: str,
+        client: httpx.Client,
+        request_gate: Any,
+        resource_cache: ReferenceMaterialCache,
+        source_repository: Any,
+        timeout: float,
+        max_dependency_count: int = DEFAULT_MAX_DEPENDENCY_COUNT,
+        max_dependency_bytes: int = DEFAULT_MAX_DEPENDENCY_BYTES,
+        max_total_dependency_bytes: int = DEFAULT_MAX_TOTAL_DEPENDENCY_BYTES,
+        max_redirects: int = DEFAULT_MAX_DEPENDENCY_REDIRECTS,
+        resolver: Callable[[str], Sequence[str]] | None = None,
+        transport_factory: Callable[[httpx.Client, Any], Any] | None = None,
+    ) -> "HtmlDependencyAcquisitionResult | HtmlSourceBundle": ...
 
 
 @dataclass(frozen=True)
-class _Extraction:
-    base_href: str
-    candidates: tuple[_Candidate, ...]
-    warnings: tuple[HtmlDependencyWarning, ...]
+class HtmlDependencyAcquisitionResult:
+    """ARC v2 projection plus the internal strict ACF sidecar."""
 
-
-@dataclass(frozen=True)
-class _FetchedResource:
-    request_url: str
-    resolved_url: str = ""
-    media_type: str = ""
-    reference: CachedResourceRef | None = None
-    error_code: str = ""
-    error_message: str = ""
+    bundle: HtmlSourceBundle
+    sidecar: Mapping[str, Any] | None = None
 
 
 def fetch_safe_response(
@@ -400,119 +409,57 @@ def acquire_html_dependencies(
     primary: SourceArtifact,
     provider: str,
     document_url: str,
+    requested_url: str | None,
     allowed_host: str,
     client: httpx.Client,
     request_gate: Any,
     resource_cache: ReferenceMaterialCache,
+    source_repository: Any,
     timeout: float,
     max_dependency_count: int = DEFAULT_MAX_DEPENDENCY_COUNT,
     max_dependency_bytes: int = DEFAULT_MAX_DEPENDENCY_BYTES,
     max_total_dependency_bytes: int = DEFAULT_MAX_TOTAL_DEPENDENCY_BYTES,
     max_redirects: int = DEFAULT_MAX_DEPENDENCY_REDIRECTS,
-) -> HtmlSourceBundle:
-    _validate_limits(
-        max_dependency_count,
-        max_dependency_bytes,
-        max_total_dependency_bytes,
-        max_redirects,
-    )
-    acquisition_policy = _acquisition_policy_document(
+    resolver: Callable[[str], Sequence[str]] | None = None,
+    transport_factory: Callable[[httpx.Client, Any], Any] | None = None,
+) -> HtmlDependencyAcquisitionResult:
+    """Delegate generic dependency acquisition to AC Foundation."""
+
+    from .html_acquisition import acquire_html_dependencies as acquire_with_acf
+
+    return acquire_with_acf(
+        payload,
+        primary=primary,
+        provider=provider,
+        document_url=document_url,
+        requested_url=requested_url,
+        allowed_host=allowed_host,
+        client=client,
+        request_gate=request_gate,
+        resource_cache=resource_cache,
+        source_repository=source_repository,
+        timeout=timeout,
         max_dependency_count=max_dependency_count,
         max_dependency_bytes=max_dependency_bytes,
         max_total_dependency_bytes=max_total_dependency_bytes,
         max_redirects=max_redirects,
+        resolver=resolver,
+        transport_factory=transport_factory,
     )
-    extraction = _extract_dependencies(payload, max_dependency_count)
-    warnings = list(extraction.warnings)
-    dependencies: list[HtmlDependency] = []
-    normalized_document = normalize_safe_https_url(
-        document_url, allowed_hosts=(allowed_host,)
-    )
-    base_url = normalized_document
-    base_error = ""
-    if extraction.base_href:
-        try:
-            base_url = normalize_safe_https_url(
-                urljoin(normalized_document, extraction.base_href),
-                allowed_hosts=(allowed_host,),
-            )
-        except HtmlSourceBundleError:
-            base_error = "authored base URL leaves the allowed provider boundary"
-            warnings.append(
-                HtmlDependencyWarning(
-                    "html_dependency_base_invalid",
-                    base_error,
-                    authored_target=extraction.base_href,
-                )
-            )
 
-    fetched: dict[str, _FetchedResource] = {}
-    counted_digests: set[str] = set()
-    total_bytes = 0
-    for candidate in extraction.candidates:
-        if candidate.attribute == "srcset":
-            dependency, warning = _unavailable(
-                candidate,
-                "html_dependency_srcset_unsupported",
-                "srcset candidate selection is not supported by bundle schema v2",
-            )
-        elif base_error:
-            dependency, warning = _unavailable(
-                candidate,
-                "html_dependency_base_invalid",
-                base_error,
-            )
-        else:
-            try:
-                request_url = _resolve_dependency_url(
-                    base_url,
-                    candidate.authored_target,
-                    allowed_host=allowed_host,
-                )
-                _validate_declared_media_type(candidate.declared_media_type)
-                _expected_media_type(request_url)
-            except HtmlSourceBundleError as exc:
-                dependency, warning = _unavailable(
-                    candidate,
-                    exc.code.replace("remote_url_invalid", "html_dependency_url_invalid"),
-                    exc.message,
-                )
-            else:
-                result = fetched.get(request_url)
-                if result is None:
-                    result = _fetch_dependency(
-                        request_url,
-                        client=client,
-                        request_gate=request_gate,
-                        resource_cache=resource_cache,
-                        allowed_host=allowed_host,
-                        timeout=timeout,
-                        max_dependency_bytes=max_dependency_bytes,
-                        max_redirects=max_redirects,
-                        counted_digests=counted_digests,
-                        remaining_total_bytes=max_total_dependency_bytes - total_bytes,
-                    )
-                    if (
-                        result.reference is not None
-                        and result.reference.resource_sha256 not in counted_digests
-                    ):
-                        total_bytes += result.reference.resource_size
-                        counted_digests.add(result.reference.resource_sha256)
-                    fetched[request_url] = result
-                dependency, warning = _dependency_from_result(candidate, result)
-        dependencies.append(dependency)
-        if warning is not None:
-            warnings.append(warning)
 
-    return HtmlSourceBundle(
-        primary=primary,
-        provider=provider,
-        document_url=normalized_document,
-        base_url=base_url,
-        acquisition_policy=acquisition_policy,
-        dependencies=tuple(dependencies),
-        warnings=tuple(warnings),
-    )
+def _sidecar_is_valid(
+    value: Any,
+    *,
+    request_key: str,
+    primary: SourceArtifact,
+    decoder: Callable[..., Any],
+) -> bool:
+    try:
+        bundle = decoder(value, request_key=request_key)
+    except (TypeError, ValueError):
+        return False
+    return bundle.primary == primary
 
 
 def fetch_cached_html_bundle(
@@ -531,6 +478,11 @@ def fetch_cached_html_bundle(
     refresh: bool,
     fetch_main: Callable[[], tuple[bytes, str]],
     build_origin: Callable[[bytes, str], SourceOrigin] | None = None,
+    dependency_acquirer: HtmlDependencyAcquirer = acquire_html_dependencies,
+    sidecar_namespace: str | None = None,
+    requested_url: str | None = None,
+    dependency_resolver: Callable[[str], Sequence[str]] | None = None,
+    dependency_transport_factory: Callable[[httpx.Client, Any], Any] | None = None,
     max_dependency_count: int = DEFAULT_MAX_DEPENDENCY_COUNT,
     max_dependency_bytes: int = DEFAULT_MAX_DEPENDENCY_BYTES,
     max_total_dependency_bytes: int = DEFAULT_MAX_TOTAL_DEPENDENCY_BYTES,
@@ -599,21 +551,47 @@ def fetch_cached_html_bundle(
             refresh=True,
             fetch=lambda: payload,
         )
-        bundle = acquire_html_dependencies(
+        acquired = dependency_acquirer(
             payload,
             primary=primary,
             provider=provider,
             document_url=document_url,
+            requested_url=requested_url,
             allowed_host=allowed_host,
             client=client,
             request_gate=request_gate,
             resource_cache=resource_cache,
+            source_repository=cache.source_repository,
             timeout=timeout,
             max_dependency_count=max_dependency_count,
             max_dependency_bytes=max_dependency_bytes,
             max_total_dependency_bytes=max_total_dependency_bytes,
             max_redirects=max_redirects,
+            resolver=dependency_resolver,
+            transport_factory=dependency_transport_factory,
         )
+        if isinstance(acquired, HtmlDependencyAcquisitionResult):
+            bundle = acquired.bundle
+            if acquired.sidecar is not None and sidecar_namespace is not None:
+                from .html_acquisition import html_acquisition_sidecar_from_document
+
+                cache.fetch_json(
+                    sidecar_namespace,
+                    request_key,
+                    fetch=lambda: {
+                        **dict(acquired.sidecar or {}),
+                        "request_key": request_key,
+                    },
+                    refresh=True,
+                    payload_validator=lambda value: _sidecar_is_valid(
+                        value,
+                        request_key=request_key,
+                        primary=primary,
+                        decoder=html_acquisition_sidecar_from_document,
+                    ),
+                )
+        else:
+            bundle = acquired
         return html_source_bundle_to_document(bundle)
 
     document = cache.fetch_json(
@@ -743,262 +721,6 @@ def bundle_resource_identities(value: Any) -> tuple[CachedResourceRef, ...]:
         for item in bundle.dependencies
         if item.availability == "available"
     )
-
-
-def _extract_dependencies(payload: bytes, maximum: int) -> _Extraction:
-    try:
-        soup = BeautifulSoup(payload, "lxml")
-    except Exception as exc:
-        return _Extraction(
-            "",
-            (),
-            (
-                HtmlDependencyWarning(
-                    "html_dependency_parse_failed",
-                    f"HTML dependency extraction failed: {exc}",
-                ),
-            ),
-        )
-    base = soup.find("base", href=True)
-    base_href = str(base.get("href") or "") if base is not None else ""
-    root = soup.select_one("article.ltx_document") or soup
-    candidates: list[_Candidate] = []
-    overflow = 0
-    for node in root.find_all(("object", "img", "source")):
-        element = str(node.name).casefold()
-        attributes: list[str] = []
-        if element == "object" and node.has_attr("data"):
-            attributes.append("data")
-        if element in {"img", "source"} and node.has_attr("src"):
-            attributes.append("src")
-        if element in {"img", "source"} and node.has_attr("srcset"):
-            attributes.append("srcset")
-        for attribute in attributes:
-            if len(candidates) >= maximum:
-                overflow += 1
-                continue
-            raw = node.get(attribute)
-            target = str(raw if raw is not None else "")
-            declared = str(node.get("type") or "").split(";", 1)[0].strip().casefold()
-            candidates.append(
-                _Candidate(
-                    len(candidates),
-                    element,
-                    attribute,
-                    target,
-                    declared,
-                )
-            )
-    warnings: tuple[HtmlDependencyWarning, ...] = ()
-    if overflow:
-        warnings = (
-            HtmlDependencyWarning(
-                "html_dependency_count_limit",
-                f"ignored {overflow} dependency references beyond the limit of {maximum}",
-            ),
-        )
-    return _Extraction(base_href, tuple(candidates), warnings)
-
-
-def _resolve_dependency_url(base_url: str, target: str, *, allowed_host: str) -> str:
-    raw = str(target or "").strip()
-    if not raw:
-        raise HtmlSourceBundleError("remote_url_invalid", "authored dependency target is empty")
-    try:
-        parsed = urlsplit(raw)
-    except ValueError as exc:
-        raise HtmlSourceBundleError("remote_url_invalid", "authored dependency target is malformed") from exc
-    if parsed.fragment:
-        raise HtmlSourceBundleError("remote_url_invalid", "dependency fragments are not supported")
-    return normalize_safe_https_url(
-        urljoin(base_url, raw),
-        allowed_hosts=(allowed_host,),
-    )
-
-
-def _fetch_dependency(
-    request_url: str,
-    *,
-    client: httpx.Client,
-    request_gate: Any,
-    resource_cache: ReferenceMaterialCache,
-    allowed_host: str,
-    timeout: float,
-    max_dependency_bytes: int,
-    max_redirects: int,
-    counted_digests: set[str],
-    remaining_total_bytes: int,
-) -> _FetchedResource:
-    try:
-        response = fetch_safe_response(
-            client,
-            request_gate,
-            request_url,
-            allowed_hosts=(allowed_host,),
-            timeout=timeout,
-            max_redirects=max_redirects,
-            redirect_error_code="html_dependency_redirect_invalid",
-            maximum_bytes=max_dependency_bytes,
-            size_error_code="html_dependency_too_large",
-        )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise HtmlSourceBundleError(
-                "html_dependency_fetch_failed",
-                str(exc),
-            ) from exc
-        _validate_response_size(
-            response,
-            max_dependency_bytes,
-            "html_dependency_too_large",
-        )
-        resolved_url = normalize_safe_https_url(
-            str(response.url), allowed_hosts=(allowed_host,)
-        )
-        media_type = _response_media_type(response)
-        if media_type not in SUPPORTED_IMAGE_MEDIA_TYPES:
-            raise HtmlSourceBundleError(
-                "html_dependency_media_type_invalid",
-                f"dependency returned unsupported media type: {media_type or '<missing>'}",
-            )
-        requested_type = _expected_media_type(request_url)
-        resolved_type = _expected_media_type(resolved_url)
-        expected = resolved_type or requested_type
-        if expected is not None and expected != media_type:
-            raise HtmlSourceBundleError(
-                "html_dependency_media_type_mismatch",
-                f"dependency extension expects {expected}, received {media_type}",
-            )
-        payload = bytes(response.content)
-        digest = hashlib.sha256(payload).hexdigest()
-        if digest not in counted_digests and len(payload) > remaining_total_bytes:
-            raise HtmlSourceBundleError(
-                "html_dependency_total_too_large",
-                "available dependency bytes exceed the document limit",
-            )
-        reference = resource_cache.store_resource(
-            payload,
-            media_type=media_type,
-            source_locator=resolved_url,
-            filename=PurePosixPath(unquote(urlsplit(resolved_url).path)).name,
-        )
-        return _FetchedResource(
-            request_url=request_url,
-            resolved_url=resolved_url,
-            media_type=media_type,
-            reference=reference,
-        )
-    except HtmlSourceBundleError as exc:
-        return _FetchedResource(
-            request_url=request_url,
-            error_code=exc.code,
-            error_message=exc.message,
-        )
-    except httpx.HTTPError as exc:
-        return _FetchedResource(
-            request_url=request_url,
-            error_code="html_dependency_fetch_failed",
-            error_message=str(exc),
-        )
-    except (OSError, ReferenceCacheError) as exc:
-        return _FetchedResource(
-            request_url=request_url,
-            error_code="html_dependency_cache_write_failed",
-            error_message=str(exc),
-        )
-
-
-def _dependency_from_result(
-    candidate: _Candidate,
-    result: _FetchedResource,
-) -> tuple[HtmlDependency, HtmlDependencyWarning | None]:
-    if result.reference is None:
-        return _unavailable(
-            candidate,
-            result.error_code,
-            result.error_message,
-            request_url=result.request_url,
-            resolved_url=result.resolved_url,
-        )
-    if candidate.declared_media_type and candidate.declared_media_type != result.media_type:
-        return _unavailable(
-            candidate,
-            "html_dependency_declared_media_type_mismatch",
-            "authored type does not match the dependency response media type",
-            request_url=result.request_url,
-            resolved_url=result.resolved_url,
-        )
-    return (
-        HtmlDependency(
-            ordinal=candidate.ordinal,
-            element=candidate.element,
-            attribute=candidate.attribute,
-            authored_target=candidate.authored_target,
-            request_url=result.request_url,
-            resolved_url=result.resolved_url,
-            declared_media_type=candidate.declared_media_type,
-            availability="available",
-            media_type=result.reference.media_type,
-            artifact_digest=result.reference.resource_sha256,
-            size=result.reference.resource_size,
-        ),
-        None,
-    )
-
-
-def _unavailable(
-    candidate: _Candidate,
-    code: str,
-    message: str,
-    *,
-    request_url: str = "",
-    resolved_url: str = "",
-) -> tuple[HtmlDependency, HtmlDependencyWarning]:
-    dependency = HtmlDependency(
-        ordinal=candidate.ordinal,
-        element=candidate.element,
-        attribute=candidate.attribute,
-        authored_target=candidate.authored_target,
-        request_url=request_url,
-        resolved_url=resolved_url,
-        declared_media_type=candidate.declared_media_type,
-        availability="unavailable",
-        error_code=code,
-        error_message=message,
-    )
-    return (
-        dependency,
-        HtmlDependencyWarning(
-            code,
-            message,
-            dependency_ordinal=candidate.ordinal,
-            element=candidate.element,
-            attribute=candidate.attribute,
-            authored_target=candidate.authored_target,
-        ),
-    )
-
-
-def _expected_media_type(url: str) -> str | None:
-    suffix = PurePosixPath(unquote(urlsplit(url).path)).suffix.casefold()
-    if not suffix:
-        return None
-    expected = _EXTENSION_MEDIA_TYPES.get(suffix)
-    if expected is None:
-        raise HtmlSourceBundleError(
-            "html_dependency_extension_unsupported",
-            f"dependency extension is unsupported: {suffix}",
-        )
-    return expected
-
-
-def _validate_declared_media_type(media_type: str) -> None:
-    if media_type and media_type not in SUPPORTED_IMAGE_MEDIA_TYPES:
-        raise HtmlSourceBundleError(
-            "html_dependency_declared_media_type_mismatch",
-            f"authored dependency type is unsupported: {media_type}",
-        )
 
 
 def _validate_limits(count: int, single: int, total: int, redirects: int) -> None:

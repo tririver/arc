@@ -88,7 +88,9 @@ from .ids import (
 from .ids import extract_paper_ids as _extract_paper_ids
 from .ids import paper_ids_safe_dir_name as _paper_ids_safe_dir_name
 from .html_dependencies import (
+    AR5IV_HTML_ACQUISITION_NAMESPACE,
     AR5IV_HTML_DEPENDENCY_NAMESPACE,
+    ARXIV_HTML_ACQUISITION_NAMESPACE,
     ARXIV_HTML_DEPENDENCY_NAMESPACE,
     HtmlSourceBundle,
     materialize_html_source_bundle,
@@ -259,6 +261,100 @@ class ArcPaperService(AcDocumentService):
             resource_cache=resource_cache,
             output_dir=output_dir,
         )
+
+    def export_arxiv_html_acquisition(
+        self,
+        paper_id: str,
+        *,
+        output_dir: str | Path,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Materialize ARC's strict ACF sidecar for ALC handoff."""
+
+        from .html_acquisition import (
+            html_acquisition_sidecar_from_document,
+            legacy_acquisition_fallback,
+            materialize_acquisition_sidecar,
+        )
+        from .providers.remote_cache import RemoteCacheError
+
+        repair_required = False
+        if not refresh:
+            for provider, namespace, request_key, requested_url in self._acquisition_sidecars(
+                paper_id
+            ):
+                try:
+                    value = provider.cache.get_json(namespace, request_key)
+                    if value is None:
+                        continue
+                    bundle = html_acquisition_sidecar_from_document(
+                        value, request_key=request_key
+                    )
+                except (OSError, ReferenceCacheError, ValueError):
+                    provider.cache.remove("json", namespace, request_key)
+                    repair_required = True
+                    break
+                except RemoteCacheError as exc:
+                    if exc.code != "remote_cache_json_corrupt":
+                        raise
+                    provider.cache.remove("json", namespace, request_key)
+                    repair_required = True
+                    break
+                except RuntimeError as exc:
+                    if getattr(exc, "code", "") not in {
+                        "html_bundle_cache_corrupt",
+                        "html_bundle_materialization_failed",
+                    }:
+                        raise
+                    provider.cache.remove("json", namespace, request_key)
+                    repair_required = True
+                    break
+                try:
+                    result = materialize_acquisition_sidecar(
+                        bundle,
+                        source_repository=provider.cache.source_repository,
+                        resource_cache=provider.resource_cache,
+                        output_dir=str(output_dir),
+                    )
+                except ReferenceCacheError:
+                    provider.cache.remove("json", namespace, request_key)
+                    repair_required = True
+                    break
+                except RuntimeError as exc:
+                    if getattr(exc, "code", "") not in {
+                        "html_bundle_cache_corrupt",
+                        "html_bundle_materialization_failed",
+                    }:
+                        raise
+                    provider.cache.remove("json", namespace, request_key)
+                    repair_required = True
+                    break
+                return {**result, "sidecar_status": "replayed"}
+
+        legacy = self.fetch_arxiv_html_bundle(
+            paper_id, refresh=refresh or repair_required
+        )
+        provider, namespace, request_key, requested_url = next(
+            item
+            for item in self._acquisition_sidecars(paper_id)
+            if (legacy.provider == "arxiv-html") == (item[1] == ARXIV_HTML_ACQUISITION_NAMESPACE)
+        )
+        value = provider.cache.get_json(namespace, request_key)
+        if value is not None:
+            bundle = html_acquisition_sidecar_from_document(
+                value, request_key=request_key
+            )
+            status = "replayed"
+        else:
+            bundle = legacy_acquisition_fallback(legacy, request_key=requested_url)
+            status = "legacy_fallback"
+        result = materialize_acquisition_sidecar(
+            bundle,
+            source_repository=provider.cache.source_repository,
+            resource_cache=provider.resource_cache,
+            output_dir=str(output_dir),
+        )
+        return {**result, "sidecar_status": status}
 
     def fetch_arxiv_pdf(
         self, paper_id: str, *, refresh: bool = False
@@ -1180,6 +1276,11 @@ class ArcPaperService(AcDocumentService):
             if component == "arxiv-html"
             else AR5IV_HTML_DEPENDENCY_NAMESPACE
         )
+        sidecar_namespace = (
+            ARXIV_HTML_ACQUISITION_NAMESPACE
+            if component == "arxiv-html"
+            else AR5IV_HTML_ACQUISITION_NAMESPACE
+        )
         request_key = (
             arxiv_versioned_path_id(paper_id)
             if component == "arxiv-html"
@@ -1188,6 +1289,7 @@ class ArcPaperService(AcDocumentService):
         for kind, namespace in (
             ("source", component),
             ("json", dependency_namespace),
+            ("json", sidecar_namespace),
         ):
             self._record_remote_component(
                 paper_id,
@@ -1197,6 +1299,28 @@ class ArcPaperService(AcDocumentService):
                 namespace=namespace,
                 request_key=request_key,
             )
+
+    def _acquisition_sidecars(self, paper_id: str):
+        from .providers.ar5iv import ar5iv_url
+        from .providers.arxiv_html import arxiv_html_bundle_url
+
+        official_key = arxiv_versioned_path_id(paper_id)
+        if official_key:
+            yield (
+                self.arxiv_html,
+                ARXIV_HTML_ACQUISITION_NAMESPACE,
+                official_key,
+                arxiv_html_bundle_url(paper_id),
+            )
+        if not arxiv_version(paper_id):
+            fallback_key = arxiv_path_id(paper_id)
+            if fallback_key:
+                yield (
+                    self.ar5iv,
+                    AR5IV_HTML_ACQUISITION_NAMESPACE,
+                    fallback_key,
+                    ar5iv_url(paper_id),
+                )
 
     def _cached_html_bundle_paper_ids(
         self, entry: CacheEntry
@@ -1925,6 +2049,20 @@ def export_arxiv_html_bundle(
     )
 
 
+def export_arxiv_html_acquisition(
+    paper_id: str,
+    *,
+    output_dir: str | Path,
+    cache_root: str | Path | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    return ArcPaperService(cache_root=cache_root).export_arxiv_html_acquisition(
+        paper_id,
+        output_dir=output_dir,
+        refresh=refresh,
+    )
+
+
 def fetch_arxiv_pdf(
     paper_id: str,
     *,
@@ -2027,6 +2165,7 @@ __all__ = [
     "default_cache_root",
     "extract_paper_ids",
     "export_arxiv_html_bundle",
+    "export_arxiv_html_acquisition",
     "export_cache",
     "export_rich_document",
     "extract_keywords",
